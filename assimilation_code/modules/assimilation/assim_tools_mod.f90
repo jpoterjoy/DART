@@ -1420,11 +1420,6 @@ ITERATIONS: do iter = 1,maxiter
 
    if (filter_kind == 9) then
 
-     ! Skip update step if weights at ob location are uniform
-     !if (1.0_r8 > 0.98_r8*ens_size*sum(w**2) ) then
-     !  cycle SEQUENTIAL_OBS
-     !end if
-
      ! Get sampling indices
      call pf_sample(obs_prior, w(1:ens_size), ens_size, indx(1:ens_size))
 
