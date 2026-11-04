@@ -82,7 +82,7 @@ for mode, th in THEMES.items():
     f, ax = fig(th)
     ne = np.array([80, 160, 320, 1000])
     series = [("LPF tempered (pf_maxiter 20, KDDM, CF merge), bins", [1.049, 0.853, 0.772, 0.730], s[0], "o"),
-              ("LPF single pass (QM merge), bins", [1.354, 1.120, 1.010, np.nan], s[1], "s"),
+              ("LPF single pass (QM merge), bins", [1.354, 1.120, 1.010, 0.928], s[1], "s"),
               ("EAKF, adaptive inflation", [0.688, 0.682, 0.689, 0.689], s[2], "D")]
     for lab, y, c, mk in series:
         y = np.array(y); ok = ~np.isnan(y)

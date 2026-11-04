@@ -79,7 +79,7 @@ the EAKF at $N_e = 1000$.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/fig_bgrid_ne_dark.png">
-  <img alt="bgrid prior RMSE versus ensemble size. Tempered LPF: 1.05, 0.85, 0.77, 0.73 at Ne 80, 160, 320, 1000. Single-pass LPF: 1.35, 1.12, 1.01 at Ne 80, 160, 320. EAKF with adaptive inflation: about 0.69 at every size." src="figures/fig_bgrid_ne_light.png" width="720">
+  <img alt="bgrid prior RMSE versus ensemble size. Tempered LPF: 1.05, 0.85, 0.77, 0.73 at Ne 80, 160, 320, 1000. Single-pass LPF: 1.35, 1.12, 1.01, 0.93 at Ne 80, 160, 320, 1000. EAKF with adaptive inflation: about 0.69 at every size." src="figures/fig_bgrid_ne_light.png" width="720">
 </picture>
 
 | $N_e$ | LPF tempered | LPF single pass | EAKF (adaptive inflation) |
@@ -87,15 +87,15 @@ the EAKF at $N_e = 1000$.
 | 80 | 1.049 | 1.354 | 0.688 |
 | 160 | 0.853 | 1.120 | 0.682 |
 | 320 | 0.772 | 1.010 | 0.689 |
-| 1000 | 0.730 | — | 0.689 |
+| 1000 | 0.730 | 0.928 | 0.689 |
 
 *Prior RMSE in obs space (m/s). LPF tempered: `pf_maxiter = 20`, KDDM,
 Cornish-Fisher merge. LPF single pass: quantile-mapping merge. Both LPF
-variants with `pf_bin_rho = 0.95`. Means of 3 seeds; Ne = 1000 is 1 seed.*
+variants with `pf_bin_rho = 0.95`. Means of 3 seeds; Ne = 1000 is 1 seed for each LPF variant.*
 
 - **The tempered configuration beats the single pass at every ensemble size.** The single pass is also
   over-dispersive at small $N_e$ (spread 2.1 against RMSE 1.35 at $N_e = 80$).
-  This improves with ensemble size (spread 1.4 at 320).
+  This improves with ensemble size (spread 1.4 at 320, 1.2 against RMSE 0.93 at 1000).
 - **The LPF's advantage is in non-Gaussian problems.** This bgrid setup is
   close to Gaussian, which is where the EAKF does best.
 
