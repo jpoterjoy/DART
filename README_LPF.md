@@ -51,13 +51,13 @@ cd ../../../models/<your_model>/work
    filter_kind = 9,
    cutoff      = 0.5,      ! localization half-width (radians on the sphere)
    frac_neff   = 0.8,      ! target effective ensemble size / Ne
-   pf_maxiter  = 3,        ! passes per cycle (1 = single pass)
+   pf_maxiter  = 3,        ! maximum passes per cycle (1 = single pass)
    pf_kddm     = 1,        ! kernel density distribution mapping after each pass
    pf_bin_rho  = 0.95,     ! bin nearby obs for the merge (faster, usually better)
    /
 
 &filter_nml
-   inf_flavor = 0, 0,      ! no inflation with the LPF
+   inf_flavor = 0, 0,      ! no adaptive inflation with the LPF
    /
 ```
 

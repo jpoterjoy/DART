@@ -50,7 +50,9 @@ Range 0 < `frac_neff` < 1. See the [tuning guide](tuning.md#frac_neff-and-the-nu
 **integer, default `1`**
 
 Maximum number of LPF passes per cycle.
-- `1`: a single pass; tempering residual left after it is discarded.
+- `1`: a single pass; any tempering residual left after it is discarded.
+  The same happens to any residual left when a tempered run reaches
+  `pf_maxiter`.
 - `> 1`: tempered LPF, which stops early once every observation's tempering
   is used up.
 
@@ -64,7 +66,8 @@ Kernel density distribution mapping after each pass, for variables whose
 particles moved outside the prior range:
 - `0`: off.
 - `1`: KDDM, extrapolating linearly beyond the particle range.
-- `2`: bounded KDDM (quantiles clipped to the posterior particle range).
+- `2`: bounded KDDM, which keeps particles within the range of the prior
+  particles.
 
 ### `bw_factor`
 **real, default `1.0`**
@@ -175,5 +178,8 @@ Not used. It is kept so that existing namelists still read.
 | `distribute_mean`, `close_obs_caching`, `print_every_nth_obs` | `.false.`, `.true.`, `0` | As in DART. |
 | `sort_obs_inc`, `spread_restoration`, `sampling_error_correction`, `rectangular_quadrature`, `gaussian_likelihood_tails` | off | Not used by the LPF. |
 
-In `&filter_nml`, keep inflation off (`inf_flavor = 0, 0`): the LPF does not
-support prior or posterior inflation.
+In `&filter_nml`, do not use adaptive inflation with the LPF. It relies on
+EAKF quantities the LPF does not compute. Fixed (non-adaptive) prior inflation
+is applied by `filter` outside the LPF and does work: in one Lorenz-96 test a
+fixed factor of 1.05 helped marginally. Usually leave it off
+(`inf_flavor = 0, 0`).

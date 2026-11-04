@@ -16,11 +16,13 @@ cp assim_tools_mod.pf.f90 assim_tools_mod.f90
 cd ../../../models/<your_model>/work && ./quickbuild.sh
 ```
 
-## Inflation is on
+## Adaptive inflation is on
 
-The LPF does not support prior or posterior inflation (adaptive or fixed).
-Set `inf_flavor = 0, 0` in `&filter_nml`. If the ensemble collapses, tune
-`frac_neff`, the number of passes and `cutoff` (see [Tuning](tuning.md)).
+The LPF does not support adaptive prior or posterior inflation, which relies
+on EAKF quantities. Set `inf_flavor = 0, 0` in `&filter_nml`. Fixed prior
+inflation is applied outside the LPF and can be used, though it was at most
+marginally helpful in tests. If the ensemble collapses, tune `frac_neff`, the
+number of passes and `cutoff` first (see [Tuning](tuning.md)).
 
 ## `WARNING! Neff is ... but target is ...`
 

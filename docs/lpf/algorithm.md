@@ -74,9 +74,11 @@ N_\text{eff}(\beta) = \frac{1}{\sum_i \tilde w_i^2}
 $$
 
 reaches $\texttt{frac\_neff} \cdot N_e$. Each state variable and each
-observation prior gets its own $\beta$. It is found in `pf_regularization` by
-a safeguarded Newton iteration, and set to $\beta = 1$ when the untempered
-weights already meet the target.
+observation prior gets its own $\beta$, found in `pf_regularization` by a
+safeguarded Newton iteration. Two cases override that:
+- $\beta = 1$ when the untempered weights already meet the target.
+- $\beta$ is capped by the variable's remaining residual (below), so that the
+  $\beta$s of all passes sum to at most 1.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/fig_tempering_dark.png">
@@ -108,7 +110,8 @@ For each observation, in sequence order:
    observation's own tempered, localized weights. Particles that survive keep
    their index, and the duplicates fill the vacated slots in random order. If
    the weights are nearly uniform ($N_\text{eff} > 0.98\,N_e$), resampling is
-   skipped.
+   skipped. Nearby variables then only accumulate this observation's weights
+   (step 2), with no merge.
 2. **Weight each nearby variable.** Every state variable and observation prior
    within the localization radius adds this observation's $-\log\omega_i$ to
    its running sum. It forms its posterior weights $\exp(-\beta \ell_i)$ and
@@ -153,8 +156,8 @@ particles (kernel-smoothed) is mapped to the same quantile of the
 kernel-smoothed posterior CDF built from the prior particles and their
 weights. The bandwidth is $\texttt{bw\_factor}\cdot\sqrt2\,\sigma\,N_e^{-1/5}$,
 with $\sigma$ the spread of the current particles.
-`pf_kddm = 2` clips the quantiles to the posterior particle range (bounded);
-`pf_kddm = 1` extrapolates linearly beyond it.
+With `pf_kddm = 2` (bounded), particles stay within the range of the prior
+particles. With `pf_kddm = 1` they can extrapolate linearly beyond it.
 
 ## 5. Binning nearby observations
 

@@ -28,7 +28,7 @@ use them as a guide to which knobs matter, not as settings to copy.
    filter_kind = 9,
    cutoff      = 0.5,     ! tune; see below
    frac_neff   = 0.8,     ! lower (0.1-0.4) for long forecast intervals
-   pf_maxiter  = 3,
+   pf_maxiter  = 3,       ! bgrid used 4-5 passes at frac_neff 0.8; capping at 3 cost little
    pf_kddm     = 1,
    pf_bin_rho  = 0.95,
    /
@@ -50,8 +50,9 @@ was what mattered:
 - Runs with different `frac_neff` lined up on one curve when plotted against
   their mean number of passes.
 
-A practical rule is to set `frac_neff` to roughly **twice the untempered
-$N_\text{eff}/N_e$**. That untempered value depends mostly on how far the
+A practical rule is to set `frac_neff` to roughly **2–5 times the untempered
+$N_\text{eff}/N_e$**, about twice when that value is large and more when it
+is small. That untempered value depends mostly on how far the
 prior has spread, i.e. the forecast interval, more than on how nonlinear the
 observation operator is:
 
@@ -65,9 +66,9 @@ and read `mean_ess1/Ne` on the `PFDIAG` lines. If `Number of PF iterations`
 always equals `pf_maxiter`, the tempering is not finishing: lower `frac_neff`
 or raise `pf_maxiter`.
 
-Values of `frac_neff` at 0.9 and above give many small steps. In bgrid they
-made the ensemble over-dispersive (spread 1.7–7.9 against RMSE 1.2–3.3), and
-in sparse networks they can diverge.
+Values of `frac_neff` at 0.9 and above give many small steps. In bgrid
+(earlier build, $N_e = 80$) they made the ensemble over-dispersive (spread
+1.7–7.9 against RMSE 1.2–3.3). In sparse networks they can diverge.
 
 ## Ensemble size
 
@@ -149,10 +150,18 @@ co-located observations. Binning removes most of the repeated merges.
 
 ## Cost
 
-A pass costs about two EAKF passes: a regularization pass and an update pass.
-A tempered run costs that times the number of passes. In bgrid, the tempered
-LPF at $N_e = 80$ took about 2 times as long as the EAKF, and about 3.5 times
-as long at $N_e = 1000$.
+Cost grows with the number of passes, and each pass is a regularization pass
+plus an update pass. Later passes are cheaper, because close lists and
+localization factors are cached (`pf_cache_close`). In bgrid:
+
+| Run | Mean passes per cycle | Run time | Relative to EAKF |
+|---|---|---|---|
+| EAKF, $N_e = 80$ | — | 212 s | 1 |
+| LPF single pass, $N_e = 80$ | 1 | 267 s | 1.3 |
+| LPF tempered, $N_e = 80$ | 5.2 | 402 s | 1.9 |
+| LPF tempered, $N_e = 1000$ (EAKF 2165 s) | 4.4 | 7499 s | 3.5 |
+
+*Both LPF runs with binning; 40 MPI tasks.*
 
 Most of the time goes to `exp` and `log` in the weight loops, so:
 - **Compile with `-O3` and an architecture flag** (e.g.
