@@ -38,7 +38,7 @@ A variable at distance $d$ from the observation receives the **localized
 weight**
 
 $$
-\omega_i = 1 + \rho(d)\thinspace \bigl(N_e w_i - 1\bigr),
+\omega_i = 1 + \rho(d)~\bigl(N_e w_i - 1\bigr),
 $$
 
 where $\rho$ is the Gaspari–Cohn function with half-width `cutoff`. At the
@@ -64,7 +64,7 @@ Applying all observations at once can collapse the weights onto a few
 particles. The LPF therefore **tempers** each variable's accumulated weights:
 
 $$
-\tilde w_i \propto \exp\left(-\beta\thinspace  \ell_i\right), \qquad \ell_i = \sum_{\text{obs}} -\log \omega_i ,
+\tilde w_i \propto \exp\left(-\beta~ \ell_i\right), \qquad \ell_i = \sum_{\text{obs}} -\log \omega_i ,
 $$
 
 with the largest $\beta \in (0, 1]$ for which the effective ensemble size
@@ -109,7 +109,7 @@ For each observation, in sequence order:
    $N_e$ indices by systematic resampling (`pf_sample`) from the
    observation's own tempered, localized weights. Particles that survive keep
    their index, and the duplicates fill the vacated slots in random order. If
-   the weights are nearly uniform ($N_\text{eff} \gt  0.98\thinspace N_e$), resampling is
+   the weights are nearly uniform ($N_\text{eff} \gt  0.98~N_e$), resampling is
    skipped. Nearby variables then only accumulate this observation's weights
    (step 2), with no merge.
 2. **Weight each nearby variable.** Every state variable and observation prior
@@ -121,7 +121,7 @@ For each observation, in sequence order:
    tempered localization coefficient:
 
    ```math
-   x^\text{blend}_i = \bar x + \beta\rho\thinspace (x^s_i - \bar x) + (1 - \beta\rho)\thinspace (x_i - \bar x).
+   x_i^{\mathrm{blend}} = \bar{x} + \beta\rho\,\left(x_i^{s} - \bar{x}\right) + \left(1 - \beta\rho\right)\left(x_i - \bar{x}\right)
    ```
 
    The blend is then adjusted to the weighted posterior by one of two methods
@@ -154,7 +154,7 @@ prior particles is remapped by **kernel density distribution mapping**
 (`pf_kddm_update`). Each current particle's quantile among the current
 particles (kernel-smoothed) is mapped to the same quantile of the
 kernel-smoothed posterior CDF built from the prior particles and their
-weights. The bandwidth is `bw_factor` × $\sqrt{2}\thinspace\sigma\thinspace N_e^{-1/5}$,
+weights. The bandwidth is `bw_factor` × $\sqrt{2}~\sigma~N_e^{-1/5}$,
 with $\sigma$ the spread of the current particles.
 With `pf_kddm = 2` (bounded), particles stay within the range of the prior
 particles. With `pf_kddm = 1` they can extrapolate linearly beyond it.

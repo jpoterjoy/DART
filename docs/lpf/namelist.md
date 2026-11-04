@@ -72,7 +72,7 @@ particles moved outside the prior range:
 ### `bw_factor`
 **real, default `1.0`**
 
-Multiplier on the KDDM kernel bandwidth $\sqrt2\thinspace \sigma\thinspace N_e^{-1/5}$. Used
+Multiplier on the KDDM kernel bandwidth $\sqrt2~\sigma~N_e^{-1/5}$. Used
 only with `pf_kddm > 0`.
 
 ### `pf_merge`
