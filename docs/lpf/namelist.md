@@ -38,7 +38,7 @@ merge. Per-type values: `special_localization_obs_types` and
 
 Target effective ensemble size for tempering, as a fraction of $N_e$. Each
 variable's $\beta$ is the largest that keeps
-$N_\text{eff} \ge \texttt{frac\_neff}\cdot N_e$.
+$N_\text{eff} \ge$ `frac_neff` × $N_e$.
 - **Higher** means smaller tempering steps, and more passes when
   `pf_maxiter > 1`.
 - **Lower** means bigger steps and fewer passes, at greater risk of weight
@@ -72,7 +72,7 @@ particles moved outside the prior range:
 ### `bw_factor`
 **real, default `1.0`**
 
-Multiplier on the KDDM kernel bandwidth $\sqrt2\,\sigma\,N_e^{-1/5}$. Used
+Multiplier on the KDDM kernel bandwidth $\sqrt2\thinspace \sigma\thinspace N_e^{-1/5}$. Used
 only with `pf_kddm > 0`.
 
 ### `pf_merge`
@@ -136,21 +136,21 @@ realizations of the same experiment.
 Print one `PFDIAG` line per pass, covering state variables with observations
 nearby:
 - the mean $\beta$;
-- the fraction with $\beta < 1$;
+- the fraction with $\beta \lt  1$;
 - the mean untempered $N_\text{eff}/N_e$.
 
 ### `pf_enkf_hybrid`
 **logical, default `.false.`**
 
 Finish each cycle with an EAKF pass (hybrid PF-EAKF, Poterjoy 2021). The PF
-passes then assimilate only $1 - \texttt{min\_residual}$ of each
+passes then assimilate only 1 − `min_residual` of each
 observation's information.
 
 ### `min_residual`
 **real, default `0.0`**
 
 Hybrid only. The fraction of each observation's information left for the
-EAKF pass, which uses error variance $R/\texttt{min\_residual}$. It is
+EAKF pass, which uses error variance $R$ / `min_residual`. It is
 ignored when `pf_enkf_hybrid = .false.`.
 
 ### `pf_kf_rtps_coeff`

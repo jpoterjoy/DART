@@ -68,16 +68,14 @@ cycle. Set `pf_diag = .true.` to also print the tempering diagnostics.
 
 ```mermaid
 flowchart TD
-    A[Prior particles<br/>state and obs space] --> B
-    subgraph PASS [One pass]
-        B["Regularization pass<br/>localized weights of every obs,<br/>tempering coefficient β per variable"] --> C
-        C["Update pass, obs by obs<br/>resample at the obs,<br/>merge with weight β·ρ at each nearby variable"] --> D
-        D["KDDM (optional)"]
-    end
-    D --> E{"All tempering used<br/>or pf_maxiter reached?"}
-    E -- no --> B
-    E -- yes --> F[Posterior particles]
-    E -. hybrid .-> G["EAKF pass with<br/>inflated obs error"] --> F
+    A["Prior particles<br/>(state and obs space)"] --> B
+    B["<b>1. Regularization pass</b><br/>localized weights of every obs;<br/>tempering coefficient β per variable"] --> C
+    C["<b>2. Update pass</b>, obs by obs<br/>resample at the obs;<br/>merge with weight β·ρ at each nearby variable"] --> D
+    D["<b>3. KDDM</b> (optional)"] --> E
+    E{"All tempering used<br/>or pf_maxiter reached?"}
+    E -- "no: next pass" --> B
+    E -- yes --> F["Posterior particles"]
+    E -. "yes, hybrid" .-> G["EAKF pass with<br/>inflated obs error"] --> F
 ```
 
 The details are on the [algorithm page](docs/lpf/algorithm.md).

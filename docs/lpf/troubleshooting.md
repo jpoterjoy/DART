@@ -40,7 +40,7 @@ harmless. Frequent ones point to extremely sharp weights. Check for:
 tempering never finishes, so part of each observation's information is
 dropped. Raise `pf_maxiter`, or lower `frac_neff` so each pass takes a bigger
 step. With `pf_diag = .true.`, the `PFDIAG` lines show the mean $\beta$ and
-the fraction of variables still tempered ($\beta < 1$) in each pass.
+the fraction of variables still tempered ($\beta \lt  1$) in each pass.
 
 ## The ensemble is over-dispersive (spread larger than error)
 

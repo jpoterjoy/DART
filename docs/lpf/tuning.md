@@ -91,7 +91,7 @@ the EAKF at $N_e = 1000$.
 
 *Prior RMSE in obs space (m/s). LPF tempered: `pf_maxiter = 20`, KDDM,
 Cornish-Fisher merge. LPF single pass: quantile-mapping merge. Both LPF
-variants with `pf_bin_rho = 0.95`. Means of 3 seeds; $N_e = 1000$ is 1 seed.*
+variants with `pf_bin_rho = 0.95`. Means of 3 seeds; Ne = 1000 is 1 seed.*
 
 - **The tempered configuration beats the single pass at every ensemble size.** The single pass is also
   over-dispersive at small $N_e$ (spread 2.1 against RMSE 1.35 at $N_e = 80$).
@@ -108,8 +108,8 @@ variants with `pf_bin_rho = 0.95`. Means of 3 seeds; $N_e = 1000$ is 1 seed.*
 | 80 | 0.3 / **0.5** / 0.8 | 1.19 / **1.08** / 1.58 |
 | 1000 | 0.5 / **0.7** / 1.0 | 0.730 / **0.669** / 0.724 |
 
-*bgrid. The $N_e = 80$ row comes from an earlier build, before the binning and
-merge changes, so compare values across that row only. At $N_e = 1000$ and
+*bgrid. The Ne = 80 row comes from an earlier build, before the binning and
+merge changes, so compare values across that row only. At Ne = 1000 and
 cutoff 0.7, the LPF beats the EAKF at cutoff 0.5 (0.689), but not the EAKF at
 cutoff 1.0 (0.564).*
 
