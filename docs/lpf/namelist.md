@@ -12,8 +12,12 @@ are those in `assim_tools_mod.pf.f90`.
 [`pf_nmoments`](#pf_nmoments) · [`pf_qm_moments`](#pf_qm_moments) ·
 [`pf_bin_rho`](#pf_bin_rho) · [`pf_cache_close`](#pf_cache_close) ·
 [`pf_seed`](#pf_seed) · [`pf_diag`](#pf_diag) ·
+[`pf_gather_mb`](#pf_gather_mb) · [`pf_profile`](#pf_profile) ·
 [`pf_enkf_hybrid`](#pf_enkf_hybrid) · [`min_residual`](#min_residual) ·
 [`pf_kf_rtps_coeff`](#pf_kf_rtps_coeff) · [`pf_alpha`](#pf_alpha)
+
+**Also:** [vertical localization tables](#vertical-localization-tables-cov_cutoff_nml)
+for observations without a vertical coordinate (`&cov_cutoff_nml`).
 
 ---
 
@@ -139,6 +143,35 @@ nearby:
 - the fraction with $\beta \lt  1$;
 - the mean untempered $N_\text{eff}/N_e$.
 
+### `pf_gather_mb`
+**real, default `200.0`**
+
+Memory per MPI task, in MB, for exchanging per-observation values between
+tasks: weights, QC and verticals, and resampling indices. These are exchanged
+in blocks of observations, one exchange per block, rather than one broadcast
+per observation. Each observation takes about $3N_e + 4$ reals, so this sets
+the number of observations per block. When all observations fit in one block,
+each pass exchanges them once.
+
+Results do not depend on it. Lower it only if memory is tight with very many
+observations per cycle.
+
+### `pf_profile`
+**logical, default `.false.`**
+
+Print wall-clock timings of the LPF, on task 0:
+- `PFPROF iter` and `PFPROF2 iter` lines for each pass: setup, the
+  regularization loop and its exchanges, the tempering coefficients, the
+  sequential loop and its exchanges, KDDM, and, within the sequential loop,
+  the owner's work, the state and obs-space updates and the bin merges. Each
+  is given for task 0 and as the maximum over tasks.
+- A `PFPROF call` line per cycle: the time in the LPF passes, and the time
+  since the previous cycle's LPF ended (model advance, I/O, forward
+  operators).
+
+Use it to find where time goes before tuning for speed; it doesn't change
+results.
+
 ### `pf_enkf_hybrid`
 **logical, default `.false.`**
 
@@ -183,3 +216,62 @@ EAKF quantities the LPF does not compute. Fixed (non-adaptive) prior inflation
 is applied by `filter` outside the LPF and does work: in one Lorenz-96 test a
 fixed factor of 1.05 helped marginally. Usually leave it off
 (`inf_flavor = 0, 0`).
+
+---
+
+## Vertical localization tables (`&cov_cutoff_nml`)
+
+Some observations have no single vertical location: a satellite channel, or a
+layer-mean temperature, depends on several model levels at once. Located with
+`VERTISUNDEF`, such an ob gets horizontal localization only, so it updates
+every level fully. These tables give it a vertical localization factor
+instead, read from the namelist for each obs type. They apply to every DART
+filter, not only the LPF.
+
+| Option | Type, default | Meaning |
+|---|---|---|
+| `vloc_types` | strings, none | Obs types that use a table (up to 20). |
+| `vloc_nlev` | integer, `0` | Number of model levels in the tables (1–100). Needed when `vloc_types` is set. |
+| `vloc_factors(k, t)` | real, `1.0` | Factor at model level `k` for the `t`-th type in `vloc_types`. |
+| `vloc_surface_level` | integer, `1` | Level whose factor applies to surface (`VERTISSURFACE`) targets. |
+
+How a factor is applied:
+- The horizontal factor is multiplied by `vloc_factors(k, t)` at the target's
+  model level `k`, interpolated linearly between levels.
+- Targets without a vertical get a factor of 1.
+- Obs types not listed, and listed types located *with* a vertical, are
+  unchanged.
+- In the LPF, an ob with a table is binned only with obs of the same type.
+
+**Which factors to use: the support rule.** Set the factor to 1 on every level
+the ob depends on (where its weighting function is nonzero), and taper with
+Gaspari–Cohn outside that range. In bgrid tests with three synthetic
+layer-temperature channels (6 seeds, prior RMSE, days 60–120):
+
+| Localization of the channels | u | v | T | ps |
+|---|---|---|---|---|
+| **Support rule** | **2.174** | **1.913** | **1.217** | 191.7 |
+| Factor 1 on the main lobe, Gaspari–Cohn outside | 2.186 | 1.925 | 1.562 | 190.2 |
+| Weighting function smoothed with Gaspari–Cohn | 2.180 | 1.918 | 1.583 | 189.4 |
+| Horizontal only (no table) | 2.276 | 2.029 | 1.701 | 195.5 |
+| EAKF (1 seed) | 2.244 | 1.991 | 1.273 | 210.9 |
+
+The support rule cut T error by 22% compared with the main-lobe rule, and beat
+the EAKF on all four variables.
+Two schemes that damp the update on levels where the channel *does* depend
+(the factor at the weighting-function peak, and the weighting function
+normalized by its maximum) made the tempered LPF diverge. On a network of
+channels with long tails it tied with the main-lobe rule. On eight narrow
+channels it was 1–1.5% worse than the main-lobe rule.
+
+Example, for a 5-level model and one channel that depends on levels 2–4
+(the type name is illustrative):
+
+```
+&cov_cutoff_nml
+   vloc_types         = 'LAYER_TEMPERATURE_CH1',
+   vloc_nlev          = 5,
+   vloc_surface_level = 5,
+   vloc_factors(1:5,1) = 0.685, 1.0, 1.0, 1.0, 0.685,
+/
+```

@@ -65,7 +65,9 @@ Mitigations:
 
 ## Runs are slow
 
-In order of payoff:
+First set `pf_profile = .true.` for a few cycles: the `PFPROF` lines show how
+much time goes to the passes, the exchanges between tasks and KDDM, and how
+much to the rest of `filter`. Then, in order of payoff:
 1. Compile with `-O3` and an architecture flag (e.g.
    `-march=skylake-avx512`) so that `exp` and `log` are vectorized. This
    roughly halves the run time.
@@ -82,6 +84,11 @@ The KDDM step is a small part of the cost.
 within the localization radius, on each task. With dense observations and a
 wide `cutoff`, set it to `.false.` if memory is tight; runs are then a few
 percent slower.
+
+The exchanges of per-observation values between tasks use up to
+[`pf_gather_mb`](namelist.md#pf_gather_mb) MB per task (default 200). With
+very many observations per cycle and little memory per task, lower it; results
+don't change, only the number of exchanges.
 
 ## Results change with the number of MPI tasks
 

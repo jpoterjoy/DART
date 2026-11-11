@@ -163,7 +163,20 @@ localization factors are cached (`pf_cache_close`). In bgrid:
 
 *Both LPF runs with binning; 40 MPI tasks.*
 
-Most of the time goes to `exp` and `log` in the weight loops, so:
+*The run times above predate the exchange speed-ups described next.*
+
+**Exchanges between MPI tasks.** Observation weights, QC and verticals, and
+resampling indices are exchanged in blocks of observations instead of one
+broadcast per observation, and finished state variables and observations are
+skipped in later passes. These changes are exact: results are byte-identical.
+In bgrid tests with 80 members and tempering, the assimilation time of a
+3-day test fell from 508 s to 153 s. On a network of 3000 soundings (about
+48,000 obs per cycle), a 120-day run fell from 16,851 s to 5,144 s of wall
+time. The block size is set by
+[`pf_gather_mb`](namelist.md#pf_gather_mb); the default suits most runs. To see
+where time goes, set [`pf_profile`](namelist.md#pf_profile).
+
+Most of the remaining time goes to `exp` and `log` in the weight loops, so:
 - **Compile with `-O3` and an architecture flag** (e.g.
   `-march=skylake-avx512`) so that vectorized math functions are used. This
   roughly halved run times, with identical results to rounding.
