@@ -134,7 +134,8 @@ public :: initialize_mpi_utilities, finalize_mpi_utilities,                  &
           broadcast_send, broadcast_recv, shell_execute, sleep_seconds,      &
           sum_across_tasks, get_dart_mpi_comm, datasize, send_minmax_to,     &
           get_from_fwd, get_from_mean, broadcast_flag, start_mpi_timer,      &
-          read_mpi_timer, send_sum_to, get_global_max, all_reduce_min_max
+          read_mpi_timer, send_sum_to, get_global_max, all_reduce_min_max, &
+          all_gather_cols
 
 character(len=*), parameter :: source = 'mpi_utilities_mod.f90'
 
@@ -1482,6 +1483,44 @@ call mpi_allreduce(MPI_IN_PLACE, min_var, num_elements, datasize, MPI_MIN, get_d
 call mpi_allreduce(MPI_IN_PLACE, max_var, num_elements, datasize, MPI_MAX, get_dart_mpi_comm(), errcode)
 
 end subroutine all_reduce_min_max
+
+!-----------------------------------------------------------------------------
+!> All tasks get the columns of an array distributed over the tasks: each task
+!> has nloc columns (nrow values each) with global column numbers gidx, and
+!> every task receives all nglob columns in out (columns that no task has are 0)
+
+subroutine all_gather_cols(nrow, nloc, gidx, vals, nglob, out)
+
+integer,  intent(in)  :: nrow, nloc, gidx(nloc), nglob
+real(r8), intent(in)  :: vals(nrow, nloc)
+real(r8), intent(out) :: out(nrow, nglob)
+
+integer, allocatable  :: cnt(:), dsp(:), allidx(:)
+real(r8), allocatable :: buf(:,:)
+integer :: errcode, t, j, n
+
+if ( .not. module_initialized ) then
+   write(errstring, *) 'initialize_mpi_utilities() must be called first'
+   call error_handler(E_ERR,'all_gather_cols', errstring, source)
+endif
+
+allocate(cnt(total_tasks), dsp(total_tasks))
+call mpi_allgather(nloc, 1, MPI_INTEGER, cnt, 1, MPI_INTEGER, get_dart_mpi_comm(), errcode)
+dsp(1) = 0
+do t = 2, total_tasks
+   dsp(t) = dsp(t-1) + cnt(t-1)
+end do
+n = sum(cnt)
+allocate(allidx(n), buf(nrow, n))
+call mpi_allgatherv(gidx, nloc, MPI_INTEGER, allidx, cnt, dsp, MPI_INTEGER, get_dart_mpi_comm(), errcode)
+call mpi_allgatherv(vals, nrow*nloc, datasize, buf, nrow*cnt, nrow*dsp, datasize, get_dart_mpi_comm(), errcode)
+
+out = 0.0_r8
+do j = 1, n
+   out(:, allidx(j)) = buf(:, j)
+end do
+
+end subroutine all_gather_cols
 
 !-----------------------------------------------------------------------------
 !> Broadcast logical

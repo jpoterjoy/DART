@@ -110,7 +110,8 @@ public :: initialize_mpi_utilities, finalize_mpi_utilities,                  &
           broadcast_send, broadcast_recv, shell_execute, sleep_seconds,      &
           sum_across_tasks, get_dart_mpi_comm, datasize, send_minmax_to,     &
           get_from_fwd, get_from_mean, broadcast_flag, start_mpi_timer,      &
-          read_mpi_timer, send_sum_to, get_global_max, all_reduce_min_max
+          read_mpi_timer, send_sum_to, get_global_max, all_reduce_min_max, &
+          all_gather_cols
 
 character(len=*), parameter :: source = 'null_mpi_utilities_mod.f90'
 
@@ -442,6 +443,25 @@ real(r8), intent(inout) :: min_var(num_elements)
 real(r8), intent(inout) :: max_var(num_elements)
 
 end subroutine all_reduce_min_max
+
+!-----------------------------------------------------------------------------
+!> All tasks get the columns of an array distributed over the tasks (one task:
+!> its own columns, placed at their global column numbers gidx)
+
+subroutine all_gather_cols(nrow, nloc, gidx, vals, nglob, out)
+
+integer,  intent(in)  :: nrow, nloc, gidx(nloc), nglob
+real(r8), intent(in)  :: vals(nrow, nloc)
+real(r8), intent(out) :: out(nrow, nglob)
+
+integer :: j
+
+out = 0.0_r8
+do j = 1, nloc
+   out(:, gidx(j)) = vals(:, j)
+end do
+
+end subroutine all_gather_cols
 
 !-----------------------------------------------------------------------------
 

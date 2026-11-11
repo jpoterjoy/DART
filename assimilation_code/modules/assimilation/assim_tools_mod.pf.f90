@@ -44,7 +44,7 @@ use          obs_def_mod, only : obs_def_type, get_obs_def_location, get_obs_def
 use         obs_kind_mod, only : get_num_types_of_obs, get_index_for_type_of_obs,                   &
                                  get_quantity_for_type_of_obs, assimilate_this_type_of_obs
 
-use       cov_cutoff_mod, only : comp_cov_factor
+use       cov_cutoff_mod, only : comp_cov_factor, vloc_has_table
 
 use       reg_factor_mod, only : comp_reg_factor
 
@@ -67,7 +67,7 @@ use ensemble_manager_mod, only : ensemble_type, get_my_num_vars, get_my_vars,   
 
 use mpi_utilities_mod,    only : my_task_id, broadcast_send, broadcast_recv,              &
                                  sum_across_tasks, task_count, start_mpi_timer,           &
-                                 read_mpi_timer, task_sync, get_global_max
+                                 read_mpi_timer, task_sync, get_global_max, all_gather_cols
 
 use adaptive_inflate_mod, only : do_obs_inflate,  do_single_ss_inflate, do_ss_inflate,    &
                                  do_varying_ss_inflate,                                   &
@@ -170,7 +170,8 @@ character(len=*), parameter :: source = 'assim_tools_mod.pf.f90'
 !      pf_cache_close -> Keep each ob's close-variable lists and localization factors
 !                 across tempering iterations, and its log-weight increments between
 !                 the regularization and update passes (faster; uses memory of about
-!                 ens_size reals per ob-variable pair on each task). Not used with
+!                 ens_size reals per ob-variable pair on each task), and each bin's
+!                 close lists and localization factors for its merge. Not used with
 !                 adaptive localization or localization diagnostics.
 !      pf_merge -> How resampled and current particles are merged: 0 fits
 !                 pf_nmoments moments (Cornish-Fisher, pf_update); 1 maps the
@@ -188,6 +189,14 @@ character(len=*), parameter :: source = 'assim_tools_mod.pf.f90'
 !      pf_diag -> Print, for each PF iteration, the mean tempering coefficient
 !                 beta over state variables with obs nearby, the fraction with
 !                 beta < 1, and their mean untempered effective ensemble size
+!      pf_profile -> Print wall-clock times of the parts of each PF iteration (task 0
+!                 and the maximum over tasks) and of each filter_assim call
+!      pf_gather_mb -> The local PF exchanges per-ob values (weights, QC and verticals,
+!                 resampling indices) between tasks in blocks of obs, one exchange per
+!                 block instead of one broadcast per ob; this is the memory per task (MB)
+!                 for a block (about 3*ens_size + 4 reals per ob), which sets the number of
+!                 obs in a block. When all obs fit in one block, each pass exchanges them
+!                 once. The results do not depend on it. Default 200.
 !      bw_factor -> multiplier for adaptive bandwidth selection in KDDM
 
 integer  :: filter_kind                     = 9
@@ -213,6 +222,9 @@ integer  :: pf_merge                        = 0
 integer  :: pf_qm_moments                   = 2
 real(r8) :: pf_bin_rho                      = 0.0_r8
 logical  :: pf_diag                         = .false.
+logical  :: pf_profile                      = .false.
+real(r8) :: pf_gather_mb                    = 200.0_r8
+real(r8) :: pf_prof_last_end                = -1.0_r8   ! end time of the last filter_assim call (pf_profile)
 
 ! since this is in the namelist, it has to have a fixed size.
 integer, parameter   :: MAX_ITEMS = 300
@@ -230,6 +242,7 @@ logical  :: gaussian_likelihood_tails       = .false.
 ! to adjust the impact of obs on other state vector and obs values.
 logical            :: adjust_obs_impact  = .false.
 character(len=256) :: obs_impact_filename = ''
+
 logical            :: allow_any_impact_values = .false.
 
 ! These next two only affect models with multiple options
@@ -272,7 +285,7 @@ namelist / assim_tools_nml / filter_kind, cutoff, sort_obs_inc, &
    pf_kddm, frac_neff, pf_alpha, bw_factor, pf_enkf_hybrid,                &
    min_residual, pf_maxiter, pf_kf_rtps_coeff, pf_nmoments, pf_seed,       &
    pf_cache_close, pf_merge, pf_qm_moments, pf_bin_rho,                    &
-   pf_diag,                                                                &
+   pf_diag, pf_profile, pf_gather_mb,                                      &
    output_localization_diagnostics, localization_diagnostics_file,         &
    special_localization_obs_types, special_localization_cutoffs,           &
    distribute_mean, close_obs_caching,                                     &
@@ -439,10 +452,9 @@ integer,  allocatable :: bin_of(:), bin_sz(:), bin_lastob(:), bin_med(:), bin_ty
 integer,  allocatable :: qc_all(:), type_all(:)
 real(r8), allocatable :: bin_cut(:), cut_all(:)
 type(location_type), allocatable :: all_loc(:), bin_loc(:)
-real(r8) :: bin_buf(1)
 real(r8) :: dg_loc(4), dg_sum(4)
 real(r8) :: lw(ens_size,ens_handle%my_num_vars), lhw(ens_size,obs_ens_handle%my_num_vars), wp(ens_size,obs_ens_handle%my_num_vars)
-real(r8) :: beta(ens_handle%my_num_vars), beta_y(obs_ens_handle%my_num_vars)
+real(r8) :: beta(ens_handle%my_num_vars), beta_y(obs_ens_handle%my_num_vars), beta_ya(obs_ens_handle%my_num_vars)
 real(r8) :: w(ens_size), ens_mean, ens_var, ws, d(ens_size), wt(ens_size), temp1, temp2, beta_hw, neff
 integer  :: indx(ens_size), filter_kind_orig
 real(r8) :: res(ens_handle%my_num_vars), res_y(obs_ens_handle%my_num_vars)
@@ -450,6 +462,37 @@ integer  :: iter, maxiter, ran_seed
 type(pf_close_cache_type), allocatable :: pfc(:)   ! per-ob cache (pf_cache_close)
 logical  :: use_pf_cache
 real(r8) :: pf_indx_r(ens_size), pf_sw(ens_size)
+! pf_profile: per-iteration times (1 setup, 2 regularization loop, 3 its broadcasts,
+! 4 coefficients, 5 sequential loop, 6 its broadcasts, 7 KDDM and the rest, 8 gather,
+! 9 and 10 the obs fetches of the regularization and sequential loops, and in the sequential
+! loop: 11 the owner's work, 12 state update, 13 obs update, 14 bin merges)
+real(r8) :: tp(14), tpmax(14), tp0, tp1, tpb, tpc, tpcall, tpn(3)
+! The owned obs' weights and (QC, vertical, which vertical); those of the obs blk0:blk1
+! (column i - blk0 + 1), exchanged in blocks of nblk obs; whether each ob has tempering
+! left at this iteration (beta_y > 0)
+real(r8), allocatable :: hw_loc(:,:), aux_loc(:,:), hw_blk(:,:), aux_blk(:,:), by_blk(:,:)
+logical,  allocatable :: by_on(:)
+integer,  allocatable :: my_obs_i(:)
+integer  :: ig, nblk, blk0, blk1, ic
+! the blocks of obs whose weights (hw0:hw1) and QC and verticals (aux0:aux1) are in
+! hw_blk and aux_blk at this iteration (-1: none)
+integer  :: hw0, hw1, aux0, aux1
+! Last PF iteration, whose merged obs-space ensemble is not used again: its obs-space
+! merges are skipped (see below)
+logical  :: last_obs_skip
+logical  :: skip_bc
+! seq_batch: the update pass takes the resampling indices from an exchange instead of
+! a broadcast per ob. The indices this task drew, as columns with keys 2*i - 1 for ob i
+! and 2*i for the merge of the bin whose last ob is i, and those of the block blk0:blk1
+! (column key - 2*blk0 + 2)
+logical  :: seq_batch
+integer  :: nev
+integer,  allocatable :: ev_key(:)
+real(r8), allocatable :: ev_ind(:,:), ind_blk(:,:)
+! Per-bin close lists and localization factors of the bin merges, kept across the
+! iterations of this call (use_pf_cache); binc_done: the bin's entry is filled
+type(pf_close_cache_type), allocatable :: binc(:)
+logical,  allocatable :: binc_done(:)
 
 integer :: my_num_obs, i, j, n, owner, owners_index, my_num_state
 integer :: this_obs_key, obs_mean_index, obs_var_index
@@ -769,6 +812,10 @@ allow_missing_in_state = get_missing_ok_status()
 use_pf_cache = filter_kind == 9 .and. pf_cache_close &
                .and. adaptive_localization_threshold <= 0 .and. .not. output_localization_diagnostics
 
+! Update pass without per-ob broadcasts, which needs the cached close lists (without
+! them, each ob's owner broadcasts its resampling indices)
+seq_batch = filter_kind == 9 .and. use_pf_cache
+
 ! Bins of nearby obs (pf_bin_rho > 0), formed at the start of the first iteration
 use_bins  = filter_kind == 9 .and. pf_bin_rho > 0.0_r8
 if (use_bins) then
@@ -780,8 +827,24 @@ endif
 
 if (use_pf_cache) allocate(pfc(obs_ens_handle%num_vars))
 
+if (pf_profile) tpcall = pf_wtime()
+if (filter_kind == 9) then
+   nblk = max(1, int(pf_gather_mb*1.0e6_r8 / (8.0_r8*(3*ens_size + 4))))
+   allocate(hw_loc(ens_size, my_num_obs), aux_loc(3, my_num_obs), my_obs_i(my_num_obs), &
+            hw_blk(ens_size, nblk), aux_blk(3, nblk), by_blk(1, nblk), by_on(obs_ens_handle%num_vars))
+   my_obs_i = int(my_obs_indx)
+   if (seq_batch) allocate(ev_key(2*my_num_obs), ev_ind(ens_size, 2*my_num_obs), &
+                           ind_blk(ens_size, 2*nblk))
+endif
+
 ! Main loop for iterative PF updates
 ITERATIONS: do iter = 1,maxiter
+
+  if (pf_profile) then
+     tp = 0.0_r8
+     tp0 = pf_wtime()
+  endif
+  last_obs_skip = .false.
 
   ens_init = ens_handle%copies(1:ens_size,:)
   obs_ens_init = obs_ens_handle%copies(1:ens_size,:)
@@ -789,29 +852,34 @@ ITERATIONS: do iter = 1,maxiter
   ! Bins of nearby obs: every task gathers the ob locations (with any converted
   ! vertical) and QC from their owners, then forms the same bins
   if (use_bins .and. iter == 1) then
+     do j = 1, my_num_obs
+        if (is_doing_vertical_conversion) then
+           vertvalue_obs_in_localization_coord = query_location(my_obs_loc(j), "VLOC")
+           whichvert_obs_in_localization_coord = query_location(my_obs_loc(j), "WHICH_VERT")
+        else
+           vertvalue_obs_in_localization_coord = 0.0_r8
+           whichvert_obs_in_localization_coord = 0
+        endif
+        aux_loc(:, j) = (/ obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, j), &
+                           vertvalue_obs_in_localization_coord,          &
+                           real(whichvert_obs_in_localization_coord, r8) /)
+     end do
+     blk1 = 0
      do i = 1, obs_ens_handle%num_vars
+        ! The QC and verticals of the next block of obs, from their owners
+        if (i > blk1) then
+           blk0 = i
+           blk1 = min(i + nblk - 1, int(obs_ens_handle%num_vars))
+           call pf_gather_range(3, my_num_obs, my_obs_i, aux_loc, blk0, blk1, aux_blk)
+        endif
+        ic = i - blk0 + 1
         call get_obs_from_key(obs_seq, keys(i), observation)
         call get_obs_def(observation, obs_def)
         base_obs_loc  = get_obs_def_location(obs_def)
         base_obs_type = get_obs_def_type_of_obs(obs_def)
-        call get_var_owner_index(ens_handle, int(i,i8), owner, owners_index)
-        if (ens_handle%my_pe == owner) then
-           if (is_doing_vertical_conversion) then
-              vertvalue_obs_in_localization_coord = query_location(my_obs_loc(owners_index), "VLOC")
-              whichvert_obs_in_localization_coord = query_location(my_obs_loc(owners_index), "WHICH_VERT")
-           else
-              vertvalue_obs_in_localization_coord = 0.0_r8
-              whichvert_obs_in_localization_coord = 0
-           endif
-           whichvert_real = real(whichvert_obs_in_localization_coord, r8)
-           obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)
-           call broadcast_send(map_pe_to_task(ens_handle, owner), bin_buf, scalar1=obs_qc, &
-                  scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
-        else
-           call broadcast_recv(map_pe_to_task(ens_handle, owner), bin_buf, scalar1=obs_qc, &
-                  scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
-           whichvert_obs_in_localization_coord = nint(whichvert_real)
-        endif
+        obs_qc = aux_blk(1, ic)
+        vertvalue_obs_in_localization_coord = aux_blk(2, ic)
+        whichvert_obs_in_localization_coord = nint(aux_blk(3, ic))
         qc_all(i)   = nint(obs_qc)
         type_all(i) = base_obs_type
         if (base_obs_type > 0) then
@@ -825,6 +893,10 @@ ITERATIONS: do iter = 1,maxiter
      end do
      call pf_make_bins(int(obs_ens_handle%num_vars), qc_all, type_all, cut_all, all_loc, pf_bin_rho, &
                        nbins, bin_of, bin_sz, bin_lastob, bin_med, bin_type, bin_cut, bin_loc)
+     if (use_pf_cache) then
+        allocate(binc(nbins), binc_done(nbins))
+        binc_done = .false.
+     endif
   end if
 
   if (filter_kind == 9 .and. pf_merge == 1) then
@@ -854,28 +926,22 @@ ITERATIONS: do iter = 1,maxiter
    ! obs-and model-space weights prior to DA step
    if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
 
-   REGULARIZATION: do i = 1, obs_ens_handle%num_vars
+   if (pf_profile) then
+      tp(1) = pf_wtime() - tp0
+      tp1 = pf_wtime()
+   endif
 
-      ! Every pe has information about the global obs sequence
-      call get_obs_from_key(obs_seq, keys(i), observation)
+   ! Weights of the obs this task owns (the likelihood depends only on this
+   ! iteration's prior obs-space values), in the order of the global loop below,
+   ! with each ob's QC and vertical in the localization coordinate
+   OWNED_WEIGHTS: do j = 1, my_num_obs
+
+      ig = int(my_obs_indx(j))
+      call get_obs_from_key(obs_seq, keys(ig), observation)
       call get_obs_def(observation, obs_def)
-      base_obs_loc = get_obs_def_location(obs_def)
       obs_err_var = get_obs_def_error_variance(obs_def)
-      base_obs_type = get_obs_def_type_of_obs(obs_def)
-      if (base_obs_type > 0) then
-         base_obs_kind = get_quantity_for_type_of_obs(base_obs_type)
-      else
-         call get_state_meta_data(-1 * int(base_obs_type,i8), dummyloc, base_obs_kind)
-      endif
-   
-      ! Get the value of the observation
       call get_obs_values(observation, obs, obs_val_index)
-   
-      ! Find out who has this observation and where it is
-      call get_var_owner_index(ens_handle, int(i,i8), owner, owners_index)
-
-      ! Owner calculates weights for current ob
-      if(ens_handle%my_pe == owner) then
+      owners_index = j
 
         ! Vertical of the ob in the localization coordinate, sent to all tasks
         ! so both passes compute the same distances (as in the update pass)
@@ -887,8 +953,9 @@ ITERATIONS: do iter = 1,maxiter
            whichvert_obs_in_localization_coord = 0
         endif
         whichvert_real = real(whichvert_obs_in_localization_coord, r8)
-   
+
         obs_qc = obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)
+        hw = 0.0_r8
 
         if(nint(obs_qc) == 0) then
 
@@ -906,16 +973,49 @@ ITERATIONS: do iter = 1,maxiter
 
         end if
 
-        call broadcast_send(map_pe_to_task(ens_handle, owner), hw, scalar1=obs_qc, &
-               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+      hw_loc(:, j)  = hw
+      aux_loc(:, j) = (/ obs_qc, vertvalue_obs_in_localization_coord, whichvert_real /)
 
+   end do OWNED_WEIGHTS
+   hw0 = -1; hw1 = -1; aux0 = -1; aux1 = -1
+
+   blk1 = 0
+   REGULARIZATION: do i = 1, obs_ens_handle%num_vars
+
+      ! The weights, QC and verticals of the next block of obs, from their owners
+      if (i > blk1) then
+         if (pf_profile) tpb = pf_wtime()
+         blk0 = i
+         blk1 = min(i + nblk - 1, int(obs_ens_handle%num_vars))
+         call pf_gather_range(ens_size, my_num_obs, my_obs_i, hw_loc, blk0, blk1, hw_blk)
+         call pf_gather_range(3, my_num_obs, my_obs_i, aux_loc, blk0, blk1, aux_blk)
+         hw0 = blk0; hw1 = blk1; aux0 = blk0; aux1 = blk1
+         if (pf_profile) tp(8) = tp(8) + pf_wtime() - tpb
+      endif
+      ic = i - blk0 + 1
+
+      if (pf_profile) tpb = pf_wtime()
+      ! Every pe has information about the global obs sequence
+      call get_obs_from_key(obs_seq, keys(i), observation)
+      call get_obs_def(observation, obs_def)
+      base_obs_loc = get_obs_def_location(obs_def)
+      obs_err_var = get_obs_def_error_variance(obs_def)
+      base_obs_type = get_obs_def_type_of_obs(obs_def)
+      if (base_obs_type > 0) then
+         base_obs_kind = get_quantity_for_type_of_obs(base_obs_type)
       else
-
-        call broadcast_recv(map_pe_to_task(ens_handle, owner), hw, scalar1=obs_qc, &
-               scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
-        whichvert_obs_in_localization_coord = nint(whichvert_real)
-
-      end if
+         call get_state_meta_data(-1 * int(base_obs_type,i8), dummyloc, base_obs_kind)
+      endif
+   
+      ! Get the value of the observation
+      call get_obs_values(observation, obs, obs_val_index)
+      if (pf_profile) tp(9) = tp(9) + pf_wtime() - tpb
+   
+      ! This ob's weights, QC and vertical
+      hw = hw_blk(:, ic)
+      obs_qc = aux_blk(1, ic)
+      vertvalue_obs_in_localization_coord = aux_blk(2, ic)
+      whichvert_obs_in_localization_coord = nint(aux_blk(3, ic))
 
       ! Skip ob if flagged by qc
       if(nint(obs_qc) /= 0) cycle REGULARIZATION
@@ -1018,6 +1118,11 @@ ITERATIONS: do iter = 1,maxiter
             endif
          endif
 
+         ! A state variable with no tempering left (res <= small) gets beta = 0 at this
+         ! iteration, so its weights are used neither here nor in the update pass
+         ! (except by the pf_diag diagnostics)
+         if (res(state_index) <= small .and. .not. pf_diag) cycle STATE_WEIGHTS
+
          ! -log() of the localized weight increment, kept for the update pass
          d = log(wt*cov_factor +  1.0_r8 + logwtmax)
          if (use_pf_cache) pfc(i)%state_d(:,j) = d
@@ -1062,6 +1167,9 @@ ITERATIONS: do iter = 1,maxiter
             endif
          endif
 
+         ! (as for the state: no tempering left, beta_y = 0 at this iteration)
+         if (res_y(obs_index) <= small .and. .not. pf_diag) cycle OBS_WEIGHTS
+
          ! -log() of the localized weight increment, kept for the update pass
          d = log(wt*cov_factor +  1.0_r8 + logwtmax)
          if (use_pf_cache) pfc(i)%obs_d(:,j) = d
@@ -1084,7 +1192,12 @@ ITERATIONS: do iter = 1,maxiter
 
    end do REGULARIZATION
 
-   ! Calculate model-space regularization coefficients 
+   if (pf_profile) then
+      tp(2) = pf_wtime() - tp1
+      tp1 = pf_wtime()
+   endif
+
+   ! Calculate model-space regularization coefficients
    ! Max residual is taken over obs space below
    max_res = 0.0_r8
    do i = 1,ens_handle%my_num_vars
@@ -1150,7 +1263,7 @@ ITERATIONS: do iter = 1,maxiter
             res_y(i) = res_y(i) - beta_y(i)
          end if
 
-         ! Store max residual of the assimilated obs (iterations stop when it is used up)
+         ! Store max residual (iterations stop when it is used up)
          max_res = max(res_y(i),max_res)
 
       else
@@ -1161,9 +1274,42 @@ ITERATIONS: do iter = 1,maxiter
 
    end do
 
+   ! Whether each ob has tempering left, on every task (an ob with beta_y = 0 has
+   ! uniform sampling weights, so no resampling indices; only assimilated obs,
+   ! DART QC 0, draw them)
+   beta_ya = beta_y
+   do i = 1, obs_ens_handle%my_num_vars
+      if (nint(obs_ens_handle%copies(OBS_GLOBAL_QC_COPY,i)) /= 0) beta_ya(i) = 0.0_r8
+   end do
+   do blk0 = 1, int(obs_ens_handle%num_vars), nblk
+      blk1 = min(blk0 + nblk - 1, int(obs_ens_handle%num_vars))
+      call pf_gather_range(1, my_num_obs, my_obs_i, beta_ya, blk0, blk1, by_blk)
+      by_on(blk0:blk1) = by_blk(1, 1:blk1-blk0+1) /= 0.0_r8
+   end do
+
    call get_global_max(max_res)
 
+   ! Diagnostics: state variables with tempering exponent left after the last pass
+   if (pf_diag .and. (max_res == 0.0_r8 .or. iter == maxiter - 1)) then
+      dg_loc(1) = real(count(res(1:ens_handle%my_num_vars) > small), r8)
+      dg_loc(2) = sum(res(1:ens_handle%my_num_vars), mask = res(1:ens_handle%my_num_vars) > small)
+      call sum_across_tasks(dg_loc(1), dg_sum(1))
+      call sum_across_tasks(dg_loc(2), dg_sum(2))
+      if (my_task_id() == 0) then
+         write(msgstring, '(A,I3,A,I9,A,F12.4)') 'PFDIAG residual iter ', iter, ' state vars left ', &
+            nint(dg_sum(1)), ' summed exponent left ', dg_sum(2)
+         call error_handler(E_MSG, 'filter_assim', msgstring)
+      endif
+   endif
+
+   ! Last iteration (no tempering left after it, no EAKF step): the obs-space ensemble
+   ! merged in it is not used again (the posterior obs-space values are recomputed from
+   ! the updated state), so its obs-space merges are skipped, and with seq_batch also
+   ! the obs-space log-weights, which then only serve those merges (same results)
+   last_obs_skip = (max_res == 0.0_r8 .or. iter == maxiter - 1) .and. .not. pf_enkf_hybrid
+
    if (timing(LG_GRN)) call read_timer(t_base(LG_GRN), 'regularization')
+   if (pf_profile) tp(4) = pf_wtime() - tp1
 
    ! Reset -log() weights to zero for sequential udpate step
    lw  = 0.0_r8
@@ -1187,8 +1333,115 @@ ITERATIONS: do iter = 1,maxiter
      first_inc_ran_call = .false.
   endif
 
+  if (pf_profile) tp1 = pf_wtime()
+
+  ! seq_batch: the resampling indices of the obs and bin merges, before the
+  ! updates. They depend only on the owners' running obs-space log-weights, which
+  ! (as in the loop below) every task accumulates for its own obs without the
+  ! updates; each task draws them in the order of the loop below (the same random
+  ! sequence) and keeps the nonzero ones, which the loop below exchanges in blocks
+  if (seq_batch .and. filter_kind == 9) then
+     nev = 0
+     blk1 = 0
+     BATCH_OBS: do i = 1, obs_ens_handle%num_vars
+        ! The QC of the next block of obs, from their owners (unless already here)
+        if (i > blk1) then
+           blk0 = i
+           blk1 = min(i + nblk - 1, int(obs_ens_handle%num_vars))
+           if (blk0 /= aux0 .or. blk1 /= aux1) &
+              call pf_gather_range(3, my_num_obs, my_obs_i, aux_loc, blk0, blk1, aux_blk)
+           aux0 = blk0; aux1 = blk1
+        endif
+        ! The owner's indices for this ob (as in the loop below)
+        call get_var_owner_index(ens_handle, int(i,i8), owner, owners_index)
+        if (ens_handle%my_pe == owner) then
+           if (nint(obs_ens_handle%copies(OBS_GLOBAL_QC_COPY, owners_index)) == 0) then
+              hw = wp(1:ens_size, owners_index)
+              d = ( lhw(1:ens_size,owners_index) - log(ens_size*hw + logwtmax) ) * beta_y(owners_index)
+              d = d - minval(d)
+              pf_sw = exp( -d )
+              pf_sw = pf_sw / sum(pf_sw)
+              if (1.0_r8 < ens_size * 0.98_r8 * sum(pf_sw*pf_sw) ) then
+                 call pf_sample(pf_sw, ens_size, indx)
+              else
+                 indx = 0
+              end if
+              if (use_bins) then
+                 if (bin_sz(i) > 1) indx = 0
+              endif
+              if (indx(1) /= 0) then
+                 nev = nev + 1
+                 ev_key(nev) = 2*i - 1
+                 ev_ind(:, nev) = real(indx, r8)
+              endif
+           endif
+        endif
+        if (nint(aux_blk(1, i - blk0 + 1)) /= 0) cycle BATCH_OBS
+
+        ! Running log-weights of my obs close to this ob (as in OBS_UPDATE)
+        do j = 1, pfc(i)%nobs
+           obs_index = pfc(i)%obs_ind(j)
+           if (any(obs_ens_handle%copies(1:ens_size, obs_index) == MISSING_R8)) cycle
+           if (pfc(i)%obs_cov(j)*beta_y(obs_index) <= small) cycle
+           if ( maxval( obs_ens_handle%copies(1:ens_size, obs_index)) == &
+                minval( obs_ens_handle%copies(1:ens_size, obs_index)) ) cycle
+           d = lhw(1:ens_size,obs_index) - pfc(i)%obs_d(:,j)
+           lhw(1:ens_size,obs_index) = d - minval(d)
+        end do
+
+        ! The owner's indices for the merge of a bin of several obs, after its last ob
+        if (use_bins) then
+           if (bin_sz(i) > 1) then
+              if (bin_lastob(bin_of(i)) == i) then
+                 ib  = bin_of(i)
+                 ibm = bin_med(ib)
+                 if (by_on(ibm)) then
+                    call get_var_owner_index(ens_handle, int(ibm,i8), owner, owners_index)
+                    if (ens_handle%my_pe == owner) then
+                       d = lhw(1:ens_size,owners_index) * beta_y(owners_index)
+                       d = d - minval(d)
+                       pf_sw = exp( -d )
+                       pf_sw = pf_sw / sum(pf_sw)
+                       if (1.0_r8 < ens_size * 0.98_r8 * sum(pf_sw*pf_sw) ) then
+                          call pf_sample(pf_sw, ens_size, indx)
+                       else
+                          indx = 0
+                       end if
+                       if (indx(1) /= 0) then
+                          nev = nev + 1
+                          ev_key(nev) = 2*i
+                          ev_ind(:, nev) = real(indx, r8)
+                       endif
+                    endif
+                 endif
+              endif
+           endif
+        endif
+     end do BATCH_OBS
+     ! (the loop below accumulates the log-weights again, with the updates)
+     lhw = 0.0_r8
+  endif
+
   ! Loop through all the (global) observations sequentially
+  blk1 = 0
   SEQUENTIAL_OBS: do i = 1, obs_ens_handle%num_vars
+
+   ! Local PF: the weights, QC, verticals and (seq_batch) resampling indices of the
+   ! next block of obs, from their owners (the weights, QC and verticals unless
+   ! already here from the passes above)
+   if (filter_kind == 9 .and. i > blk1) then
+      if (pf_profile) tpb = pf_wtime()
+      blk0 = i
+      blk1 = min(i + nblk - 1, int(obs_ens_handle%num_vars))
+      if (blk0 /= hw0 .or. blk1 /= hw1) &
+         call pf_gather_range(ens_size, my_num_obs, my_obs_i, hw_loc, blk0, blk1, hw_blk)
+      if (blk0 /= aux0 .or. blk1 /= aux1) &
+         call pf_gather_range(3, my_num_obs, my_obs_i, aux_loc, blk0, blk1, aux_blk)
+      hw0 = blk0; hw1 = blk1; aux0 = blk0; aux1 = blk1
+      if (seq_batch) call pf_gather_range(ens_size, nev, ev_key, ev_ind, 2*blk0 - 1, 2*blk1, ind_blk)
+      if (pf_profile) tp(6) = tp(6) + pf_wtime() - tpb
+   endif
+   if (filter_kind == 9) ic = i - blk0 + 1
 
    if (timing(MLOOP))  call start_timer(t_base(MLOOP))
    if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
@@ -1209,6 +1462,7 @@ ITERATIONS: do iter = 1,maxiter
       endif
    endif
 
+   if (pf_profile) tpb = pf_wtime()
    ! Every pe has information about the global obs sequence
    call get_obs_from_key(obs_seq, keys(i), observation)
    call get_obs_def(observation, obs_def)
@@ -1222,13 +1476,36 @@ ITERATIONS: do iter = 1,maxiter
    endif
    ! Get the value of the observation
    call get_obs_values(observation, obs, obs_val_index)
+   if (pf_profile) tp(10) = tp(10) + pf_wtime() - tpb
 
    ! Find out who has this observation and where it is
    call get_var_owner_index(ens_handle, int(i,i8), owner, owners_index)
 
+   ! Local PF without seq_batch: an ob in a bin of several obs has no resampling
+   ! indices of its own (they are 0), and its weights, QC and vertical are those
+   ! exchanged above, so nothing is broadcast for it (its owner still draws its
+   ! resampling indices, to keep the random sequence); nor for an ob with no
+   ! tempering left at this iteration (beta_y = 0: uniform sampling weights, no
+   ! resampling and no random draw)
+   skip_bc = .false.
+   if (filter_kind == 9) then
+      skip_bc = .not. by_on(i)
+      if (use_bins) skip_bc = skip_bc .or. bin_sz(i) > 1
+   endif
+
+   if (pf_profile) tpc = pf_wtime()
+   ! seq_batch: this ob's weights, QC and vertical, and its resampling indices
+   ! (0 unless drawn above), from the exchanges
+   if (seq_batch .and. filter_kind == 9) then
+      hw = hw_blk(:, ic)
+      obs_qc = aux_blk(1, ic)
+      vertvalue_obs_in_localization_coord = aux_blk(2, ic)
+      whichvert_obs_in_localization_coord = nint(aux_blk(3, ic))
+      pf_indx_r = ind_blk(:, 2*ic - 1)
+
    ! Following block is done only by the owner of this observation
    !-----------------------------------------------------------------------
-   if(ens_handle%my_pe == owner) then
+   else if(ens_handle%my_pe == owner) then
       ! each task has its own subset of all obs.  if they were converted in the
       ! vertical up above, then we need to broadcast the new values to all the other
       ! tasks so they're computing the right distances when applying the increments.
@@ -1356,8 +1633,12 @@ ITERATIONS: do iter = 1,maxiter
       whichvert_real = real(whichvert_obs_in_localization_coord, r8)
 
       if (filter_kind == 9) then
+        if (.not. skip_bc) then
+        if (pf_profile) tpb = pf_wtime()
         call broadcast_send(map_pe_to_task(ens_handle, owner), pf_indx_r, hw, scalar1=obs_qc, &
                scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+        if (pf_profile) tp(6) = tp(6) + pf_wtime() - tpb
+        endif
       else
 
          if(local_varying_ss_inflate) then
@@ -1387,8 +1668,18 @@ ITERATIONS: do iter = 1,maxiter
 
       ! PF needs to broadcast different variables than other filters 
       if (filter_kind == 9) then
+        if (skip_bc) then
+          hw = hw_blk(:, ic)
+          obs_qc = aux_blk(1, ic)
+          vertvalue_obs_in_localization_coord = aux_blk(2, ic)
+          whichvert_real = aux_blk(3, ic)
+          pf_indx_r = 0.0_r8
+        else
+          if (pf_profile) tpb = pf_wtime()
           call broadcast_recv(map_pe_to_task(ens_handle, owner), pf_indx_r, hw, scalar1=obs_qc, &
              scalar2=vertvalue_obs_in_localization_coord, scalar3=whichvert_real)
+          if (pf_profile) tp(6) = tp(6) + pf_wtime() - tpb
+        endif
       else
          if(local_varying_ss_inflate) then
             call broadcast_recv(map_pe_to_task(ens_handle, owner), obs_prior, obs_inc, &
@@ -1409,6 +1700,7 @@ ITERATIONS: do iter = 1,maxiter
    endif
    !-----------------------------------------------------------------------
 
+   if (pf_profile) tp(11) = tp(11) + pf_wtime() - tpc
    ! Everybody is doing this section, cycle if qc is bad
    if(nint(obs_qc) /= 0) then
       if (timing(MLOOP)) then
@@ -1636,6 +1928,7 @@ ITERATIONS: do iter = 1,maxiter
 
    endif
 
+   if (pf_profile) tpc = pf_wtime()
    ! Loop through to update each of my state variables that is potentially close
    if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
    STATE_UPDATE: do j = 1, num_close_states
@@ -1856,6 +2149,7 @@ ITERATIONS: do iter = 1,maxiter
       endif
 
    end do STATE_UPDATE
+   if (pf_profile) tp(12) = tp(12) + pf_wtime() - tpc
    if (timing(LG_GRN)) then
       write(msgstring, '(A32,I7)') 'state_update: obs', keys(i)
       call read_timer(t_base(LG_GRN), msgstring)
@@ -1865,9 +2159,11 @@ ITERATIONS: do iter = 1,maxiter
 
    !------------------------------------------------------
 
+   if (pf_profile) tpc = pf_wtime()
    ! Now everybody updates their obs priors (only ones after this one)
    if (timing(LG_GRN)) call start_timer(t_base(LG_GRN))
    OBS_UPDATE: do j = 1, num_close_obs
+      if (last_obs_skip .and. seq_batch) exit OBS_UPDATE
       obs_index = close_obs_ind(j)
 
       ! The local PF now iterates multiple times over observations, so it still needs 
@@ -1920,7 +2216,7 @@ ITERATIONS: do iter = 1,maxiter
             d = lhw(1:ens_size,obs_index) - d
             lhw(1:ens_size,obs_index) = d - minval(d)
            
-            if (indx(1) == 0) cycle OBS_UPDATE
+            if (indx(1) == 0 .or. last_obs_skip) cycle OBS_UPDATE
 
             ! Get obs-space weights            
             wo = exp(-lhw(1:ens_size,obs_index)*beta_y(obs_index))
@@ -2003,7 +2299,9 @@ ITERATIONS: do iter = 1,maxiter
       endif
 
    end do OBS_UPDATE
+   if (pf_profile) tp(13) = tp(13) + pf_wtime() - tpc
 
+   if (pf_profile) tpc = pf_wtime()
    ! Merge the particles for a bin of several obs, after its last ob. The
    ! weights already include every ob in the bin (each with its own
    ! localization); the merge is localized about the bin centroid.
@@ -2014,6 +2312,12 @@ ITERATIONS: do iter = 1,maxiter
          ! Resampling indices from the tempered weights of the bin's most central
          ! ob (which include every ob in the bin), computed by its owner
          ibm = bin_med(ib)
+         ! (none when that ob has no tempering left, beta_y = 0)
+         if (filter_kind == 9 .and. .not. by_on(ibm)) then
+            pf_indx_r = 0.0_r8
+         else if (seq_batch .and. filter_kind == 9) then
+            pf_indx_r = ind_blk(:, 2*ic)
+         else
          call get_var_owner_index(ens_handle, int(ibm,i8), owner, owners_index)
          if (ens_handle%my_pe == owner) then
             d = lhw(1:ens_size,owners_index) * beta_y(owners_index)
@@ -2030,23 +2334,43 @@ ITERATIONS: do iter = 1,maxiter
          else
             call broadcast_recv(map_pe_to_task(ens_handle, owner), pf_indx_r)
          endif
+         endif
          indx = nint(pf_indx_r)
 
          if (indx(1) /= 0) then
 
-          call get_close_state(gc_state, bin_loc(ib), bin_type(ib), &
-                               my_state_loc, my_state_kind, my_state_indx, &
-                               num_close_states, close_state_ind, close_state_dist, ens_handle)
+          ! Close states and localization factors: from the bin cache after the
+          ! bin's first merge in this call
+          if (use_pf_cache .and. binc_done(ib)) then
+             num_close_states = binc(ib)%nstate
+          else
+             call get_close_state(gc_state, bin_loc(ib), bin_type(ib), &
+                                  my_state_loc, my_state_kind, my_state_indx, &
+                                  num_close_states, close_state_ind, close_state_dist, ens_handle)
+             if (use_pf_cache) then
+                binc(ib)%nstate = num_close_states
+                allocate(binc(ib)%state_ind(num_close_states), binc(ib)%state_cov(num_close_states))
+             endif
+          endif
 
           BIN_STATE: do j = 1, num_close_states
-             state_index = close_state_ind(j)
+             if (use_pf_cache .and. binc_done(ib)) then
+                state_index = binc(ib)%state_ind(j)
+                cov_factor  = binc(ib)%state_cov(j)
+             else
+                state_index = close_state_ind(j)
+                cov_factor = comp_cov_factor(close_state_dist(j), bin_cut(ib), &
+                   bin_loc(ib), bin_type(ib), my_state_loc(state_index), my_state_kind(state_index))
+                if (adjust_obs_impact) cov_factor = cov_factor * &
+                   obs_impact_table(bin_type(ib), my_state_kind(state_index))
+                if (use_pf_cache) then
+                   binc(ib)%state_ind(j) = int(state_index)
+                   binc(ib)%state_cov(j) = cov_factor
+                endif
+             endif
              if ( allow_missing_in_state ) then
                 if (any(ens_handle%copies(1:ens_size, state_index) == MISSING_R8)) cycle BIN_STATE
              endif
-             cov_factor = comp_cov_factor(close_state_dist(j), bin_cut(ib), &
-                bin_loc(ib), bin_type(ib), my_state_loc(state_index), my_state_kind(state_index))
-             if (adjust_obs_impact) cov_factor = cov_factor * &
-                obs_impact_table(bin_type(ib), my_state_kind(state_index))
              if ( cov_factor*beta(state_index) <= small ) cycle BIN_STATE
              if ( maxval( ens_handle%copies(1:ens_size, state_index)) == &
                   minval( ens_handle%copies(1:ens_size, state_index)) ) cycle BIN_STATE
@@ -2071,17 +2395,37 @@ ITERATIONS: do iter = 1,maxiter
                 ens_handle%copies(1:ens_size, state_index) + increment(1:ens_size)
           end do BIN_STATE
 
-          call get_close_obs(gc_obs, bin_loc(ib), bin_type(ib), &
-                             my_obs_loc, my_obs_kind, my_obs_type, &
-                             num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+          ! (none of the obs-space merges at the last iteration, last_obs_skip)
+          if (last_obs_skip) then
+             num_close_obs = 0
+          else if (use_pf_cache .and. binc_done(ib)) then
+             num_close_obs = binc(ib)%nobs
+          else
+             call get_close_obs(gc_obs, bin_loc(ib), bin_type(ib), &
+                                my_obs_loc, my_obs_kind, my_obs_type, &
+                                num_close_obs, close_obs_ind, close_obs_dist, ens_handle)
+             if (use_pf_cache) then
+                binc(ib)%nobs = num_close_obs
+                allocate(binc(ib)%obs_ind(num_close_obs), binc(ib)%obs_cov(num_close_obs))
+             endif
+          endif
 
           BIN_OBS: do j = 1, num_close_obs
-             obs_index = close_obs_ind(j)
+             if (use_pf_cache .and. binc_done(ib)) then
+                obs_index  = binc(ib)%obs_ind(j)
+                cov_factor = binc(ib)%obs_cov(j)
+             else
+                obs_index = close_obs_ind(j)
+                cov_factor = comp_cov_factor(close_obs_dist(j), bin_cut(ib), &
+                   bin_loc(ib), bin_type(ib), my_obs_loc(obs_index), my_obs_kind(obs_index))
+                if (adjust_obs_impact) cov_factor = cov_factor * &
+                   obs_impact_table(bin_type(ib), my_obs_kind(obs_index))
+                if (use_pf_cache) then
+                   binc(ib)%obs_ind(j) = obs_index
+                   binc(ib)%obs_cov(j) = cov_factor
+                endif
+             endif
              if (any(obs_ens_handle%copies(1:ens_size, obs_index) == MISSING_R8)) cycle BIN_OBS
-             cov_factor = comp_cov_factor(close_obs_dist(j), bin_cut(ib), &
-                bin_loc(ib), bin_type(ib), my_obs_loc(obs_index), my_obs_kind(obs_index))
-             if (adjust_obs_impact) cov_factor = cov_factor * &
-                obs_impact_table(bin_type(ib), my_obs_kind(obs_index))
              if ( cov_factor*beta_y(obs_index) <= small ) cycle BIN_OBS
              if ( maxval( obs_ens_handle%copies(1:ens_size, obs_index)) == &
                   minval( obs_ens_handle%copies(1:ens_size, obs_index)) ) cycle BIN_OBS
@@ -2105,10 +2449,12 @@ ITERATIONS: do iter = 1,maxiter
              if (.not. inflate_only) obs_ens_handle%copies(1:ens_size, obs_index) = &
                 obs_ens_handle%copies(1:ens_size, obs_index) + increment(1:ens_size)
           end do BIN_OBS
+          if (use_pf_cache) binc_done(ib) = .true.
          endif
          endif
       endif
    endif
+   if (pf_profile) tp(14) = tp(14) + pf_wtime() - tpc
    if (timing(LG_GRN)) then
       write(msgstring, '(A32,I7)') 'obs_update: obs', keys(i)
       call read_timer(t_base(LG_GRN), msgstring)
@@ -2122,6 +2468,11 @@ ITERATIONS: do iter = 1,maxiter
    endif
 
 end do SEQUENTIAL_OBS
+
+if (pf_profile) then
+   tp(5) = pf_wtime() - tp1
+   tp1 = pf_wtime()
+endif
 
 ! Additional corrections to state variables using KDDM
 if (filter_kind == 9 .and. pf_kddm > 0 ) then
@@ -2150,6 +2501,9 @@ if (filter_kind == 9 .and. pf_kddm > 0 ) then
    enddo
 
    do i = 1,obs_ens_handle%my_num_vars
+
+     ! (not at the last iteration, last_obs_skip)
+     if (last_obs_skip) exit
 
      ! Update only when posterior ensemble is outside span of prior ensemble
      if ( maxval(obs_ens_handle%copies(1:ens_size, i)) > maxval(obs_ens_init(1:ens_size, i) ) .or. & 
@@ -2224,6 +2578,27 @@ if (filter_kind == 1 .and. .not. local_varying_ss_inflate) then
    end if
 
 end if
+
+if (pf_profile) then
+   tp(7) = pf_wtime() - tp1
+   do j = 1, 14
+      tpmax(j) = tp(j)
+      call get_global_max(tpmax(j))
+   end do
+   ! state variables and assimilated obs with tempering left at this iteration
+   call sum_across_tasks(real(count(beta > 0.0_r8), r8), tpn(1))
+   call sum_across_tasks(real(count(beta_y > 0.0_r8), r8), tpn(2))
+   call sum_across_tasks(real(ens_handle%my_num_vars, r8), tpn(3))
+   if (my_task_id() == 0) then
+      write(msgstring, '(A,I3,A,8F8.3,A,8F8.3)') 'PFPROF iter ', iter, &
+         ' task0 (setup reg reg_bc coef seq seq_bc kddm+ gather): ', tp(1:8), '  max: ', tpmax(1:8)
+      call error_handler(E_MSG, 'filter_assim', msgstring)
+      write(msgstring, '(A,I3,A,6F8.3,A,6F8.3,A,3I9)') 'PFPROF2 iter ', iter, &
+         ' task0 (regfetch seqfetch owner stupd obupd merge): ', tp(9:14), '  max: ', tpmax(9:14), &
+         '  active states, obs; states: ', nint(tpn)
+      call error_handler(E_MSG, 'filter_assim', msgstring)
+   endif
+endif
 
 ! Exit PF loop by setting max_res to zero once maxiter is reached
 if (iter == maxiter-1) then
@@ -2360,7 +2735,52 @@ deallocate(n_close_state_items, &
            n_close_obs_items)
 ! end dealloc
 
+! pf_profile: time of the PF iterations of this call, and from the end of the
+! last call to the start of this call's iterations (model advance, I/O, forward
+! operators, filter_assim setup)
+if (pf_profile) then
+   tp1 = pf_wtime()
+   if (my_task_id() == 0) then
+      write(msgstring, '(A,F9.3,A,F9.3)') 'PFPROF call: iterations ', tp1 - tpcall, &
+         '  since last call ', merge(tpcall - pf_prof_last_end, -1.0_r8, pf_prof_last_end > 0.0_r8)
+      call error_handler(E_MSG, 'filter_assim', msgstring)
+   endif
+   pf_prof_last_end = tp1
+endif
+
 end subroutine filter_assim
+
+!-------------------------------------------------------------
+!> Wall-clock time in seconds (pf_profile)
+
+function pf_wtime()
+
+real(r8) :: pf_wtime
+integer(i8) :: c, r
+
+call system_clock(c, r)
+pf_wtime = real(c, r8)/real(r, r8)
+
+end function pf_wtime
+
+!-------------------------------------------------------------
+!> Columns i0:i1 of an array of per-ob (or per-key) values held by their owners, on
+!> every task: vals holds the nloc columns this task owns, with keys gidx; out(:, k)
+!> is the column with key i0 + k - 1 (0 where no task holds that key)
+
+subroutine pf_gather_range(nrow, nloc, gidx, vals, i0, i1, out)
+
+integer,  intent(in)  :: nrow, nloc, gidx(nloc), i0, i1
+real(r8), intent(in)  :: vals(nrow, nloc)
+real(r8), intent(out) :: out(nrow, i1 - i0 + 1)
+
+integer, allocatable :: sel(:)
+integer :: j
+
+sel = pack( (/ (j, j = 1, nloc) /), gidx >= i0 .and. gidx <= i1 )
+call all_gather_cols(nrow, size(sel), gidx(sel) - i0 + 1, vals(:, sel), i1 - i0 + 1, out)
+
+end subroutine pf_gather_range
 
 !-------------------------------------------------------------
 
@@ -3433,11 +3853,26 @@ type(location_type), allocatable :: bl(:)
 real(r8) :: ll(3), rho, x, lon, lat, r
 integer  :: i, b, sel
 logical  :: sphere, line
+! On the sphere, the bins are indexed by the cell of their centroid's unit vector
+! in a grid of cubes of side hcell >= 2 x the largest cutoff (plus a margin), so
+! only bins in the 27 cells around an ob can be within twice its cutoff, where all
+! the localization functions of cov_cutoff_mod are zero (the distance is at least
+! the horizontal chord); bins in each cell are a doubly linked list
+real(r8) :: hcell
+integer  :: ncell, ic(3), cnew, jx, jy, jz
+integer, allocatable :: head(:), nxt(:), prv(:), cellb(:)
 
 allocate(ssum(4,nobs), cc(nobs), best(nobs), n(nobs), lastob(nobs), btype(nobs), &
          wv(nobs), med(nobs), bl(nobs))
 sphere = trim(LocationName) == 'loc3Dsphere'
 line   = trim(LocationName) == 'loc1d'
+
+if (sphere) then
+   hcell = 2.0_r8*maxval(cut, mask = qc == 0)*1.01_r8 + 0.01_r8
+   ncell = max(1, min(200, int(2.0_r8/hcell)))
+   allocate(head(ncell**3), nxt(nobs), prv(nobs), cellb(nobs))
+   head = 0
+endif
 
 nbins  = 0
 bin_of = 0
@@ -3445,18 +3880,32 @@ bin_sz = 1
 do i = 1, nobs
    if (qc(i) /= 0) cycle
 
-   ! First bin whose centroid is close to this ob
+   ! First bin whose centroid is close to this ob (on the sphere, the lowest-numbered
+   ! such bin among those in the cells around the ob)
    sel = 0
-   do b = 1, nbins
-      if (sphere) then
-         if (nint(query_location(loc(i), 'WHICH_VERT')) /= wv(b)) cycle
-      endif
-      rho = comp_cov_factor(get_dist(loc(i), bl(b)), min(cut(i), cc(b)))
-      if (rho >= rho_min) then
-         sel = b
-         exit
-      endif
-   end do
+   if (sphere) then
+      call bin_cell(loc(i), ic)
+      do jz = max(0, ic(3)-1), min(ncell-1, ic(3)+1)
+         do jy = max(0, ic(2)-1), min(ncell-1, ic(2)+1)
+            do jx = max(0, ic(1)-1), min(ncell-1, ic(1)+1)
+               b = head(1 + jx + ncell*(jy + ncell*jz))
+               do while (b > 0)
+                  if (sel == 0 .or. b < sel) then
+                     if (bin_accepts(b)) sel = b
+                  endif
+                  b = nxt(b)
+               end do
+            end do
+         end do
+      end do
+   else
+      do b = 1, nbins
+         if (bin_accepts(b)) then
+            sel = b
+            exit
+         endif
+      end do
+   endif
 
    if (sel == 0) then
       nbins = nbins + 1
@@ -3503,6 +3952,23 @@ do i = 1, nobs
       if (lon < 0.0_r8) lon = lon + 360.0_r8
       bl(sel) = set_location( (/ lon, lat, ssum(4,sel)/n(sel), real(wv(sel), r8) /) )
    endif
+
+   ! Cell of the (new or moved) centroid
+   if (sphere) then
+      call bin_cell(bl(sel), ic)
+      cnew = 1 + ic(1) + ncell*(ic(2) + ncell*ic(3))
+      if (n(sel) == 1) then
+         call cell_insert(sel, cnew)
+      else if (cnew /= cellb(sel)) then
+         if (prv(sel) > 0) then
+            nxt(prv(sel)) = nxt(sel)
+         else
+            head(cellb(sel)) = nxt(sel)
+         endif
+         if (nxt(sel) > 0) prv(nxt(sel)) = prv(sel)
+         call cell_insert(sel, cnew)
+      endif
+   endif
 end do
 
 ! Bin sizes and most central members
@@ -3532,7 +3998,46 @@ if (do_output()) then
    call error_handler(E_MSG, 'pf_make_bins', msgstring)
 endif
 
+contains
+
+! Whether bin b takes ob i: same vertical coordinate (sphere), same type for obs
+! types with a vertical localization table (so the bin's merge uses their table),
+! and a coefficient with the bin's centroid of at least rho_min
+logical function bin_accepts(b)
+integer, intent(in) :: b
+bin_accepts = .false.
+if (sphere) then
+   if (nint(query_location(loc(i), 'WHICH_VERT')) /= wv(b)) return
+endif
+if (vloc_has_table(otype(i)) .or. vloc_has_table(btype(b))) then
+   if (otype(i) /= btype(b)) return
+endif
+bin_accepts = comp_cov_factor(get_dist(loc(i), bl(b)), min(cut(i), cc(b))) >= rho_min
+end function bin_accepts
+
+! Cell (0-based in each direction) of a location's unit vector
+subroutine bin_cell(l, icell)
+type(location_type), intent(in)  :: l
+integer,             intent(out) :: icell(3)
+real(r8) :: lv(3), u(3)
+lv = get_location(l)
+u = (/ cos(lv(2)*PI/180.0_r8)*cos(lv(1)*PI/180.0_r8), &
+       cos(lv(2)*PI/180.0_r8)*sin(lv(1)*PI/180.0_r8), sin(lv(2)*PI/180.0_r8) /)
+icell = min(ncell-1, max(0, int((u + 1.0_r8)*ncell/2.0_r8)))
+end subroutine bin_cell
+
+! Put bin b at the head of cell c's list
+subroutine cell_insert(b, c)
+integer, intent(in) :: b, c
+prv(b) = 0
+nxt(b) = head(c)
+if (head(c) > 0) prv(head(c)) = b
+head(c) = b
+cellb(b) = c
+end subroutine cell_insert
+
 end subroutine pf_make_bins
+
 
 
 
@@ -5049,6 +5554,7 @@ end if
   incr = xa_new - xa
 
 end subroutine pf_kddm_update
+
 
 
 !> @}
