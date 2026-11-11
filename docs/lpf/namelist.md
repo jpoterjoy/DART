@@ -225,23 +225,46 @@ Some observations have no single vertical location: a satellite channel, or a
 layer-mean temperature, depends on several model levels at once. Located with
 `VERTISUNDEF`, such an ob gets horizontal localization only, so it updates
 every level fully. These tables give it a vertical localization factor
-instead, read from the namelist for each obs type. They apply to every DART
-filter, not only the LPF.
+instead, read from the namelist for each obs type. They live in DART's
+`cov_cutoff_mod` and apply to every DART filter, not only the LPF, and to any
+model.
 
 | Option | Type, default | Meaning |
 |---|---|---|
 | `vloc_types` | strings, none | Obs types that use a table (up to 20). |
-| `vloc_nlev` | integer, `0` | Number of model levels in the tables (1–100). Needed when `vloc_types` is set. |
-| `vloc_factors(k, t)` | real, `1.0` | Factor at model level `k` for the `t`-th type in `vloc_types`. |
-| `vloc_surface_level` | integer, `1` | Level whose factor applies to surface (`VERTISSURFACE`) targets. |
+| `vloc_nlev` | integer, `0` | Number of rows in every table (1–200). Needed when `vloc_types` is set. |
+| `vloc_factors(k, t)` | real, `1.0` | Factor in row `k` of the table for the `t`-th type in `vloc_types`. |
+| `vloc_coord(t)` | string, `'level'` | The vertical coordinate of table `t`: `'level'`, `'pressure'`, `'height'` or `'scale_height'`. |
+| `vloc_points(k, t)` | real, unset | For non-level tables: the coordinate of row `k` (Pa, m, or scale height). Must be set for rows 1 to `vloc_nlev`, strictly increasing or decreasing; positive for pressure. Not used by level tables. |
+| `vloc_surface_level` | integer, `1` | Row whose factor applies to surface (`VERTISSURFACE`) targets, in any table. |
+| `vloc_mismatch` | string, `'error'` | What happens when a table meets a target located in a different vertical coordinate: `'error'` stops the run; `'warn'` uses a factor of 1, with one warning per table and coordinate. |
 
-How a factor is applied:
-- The horizontal factor is multiplied by `vloc_factors(k, t)` at the target's
-  model level `k`, interpolated linearly between levels.
-- Targets without a vertical get a factor of 1.
+How a factor is applied, for an ob of a listed type located with `VERTISUNDEF`:
+- **Level tables:** row `k` is model level `k`. The target's level is
+  interpolated linearly between rows.
+- **Pressure, height and scale-height tables:** the target's vertical
+  coordinate is interpolated between the rows' `vloc_points`, linearly in
+  log-pressure for pressure tables, linearly otherwise. Beyond the first or
+  last row, that row's factor is used.
+- **Surface targets** use row `vloc_surface_level`; **targets without a
+  vertical** get 1.
+- **A target in any other coordinate** is handled by `vloc_mismatch`. Before
+  this check was added, such targets silently got a factor of 1.
 - Obs types not listed, and listed types located *with* a vertical, are
   unchanged.
 - In the LPF, an ob with a table is binned only with obs of the same type.
+
+**Match the table to how your model locates its state.** The table's
+coordinate must be the one the *targets* use when the localization is
+computed: the state variables, and any other obs the ob updates. bgrid
+locates its state on model levels, so level tables work there. Many models
+(e.g. WRF, MPAS, CAM) localize in pressure or height, often after converting
+the state verticals (`convert_all_state_verticals_first`, or the model's own
+vertical-localization setting). For those, use a `'pressure'` or `'height'`
+table. Pressure tables also suit channel weighting functions, which are
+usually given in pressure. The default `vloc_mismatch = 'error'` stops the run
+at the first target in the wrong coordinate, so a table can't be ignored
+unnoticed.
 
 **Which factors to use: the support rule.** Set the factor to 1 on every level
 the ob depends on (where its weighting function is nonzero), and taper with
@@ -264,14 +287,30 @@ normalized by its maximum) made the tempered LPF diverge. On a network of
 channels with long tails it tied with the main-lobe rule. On eight narrow
 channels it was 1–1.5% worse than the main-lobe rule.
 
-Example, for a 5-level model and one channel that depends on levels 2–4
-(the type name is illustrative):
+Examples (the type names are illustrative).
+
+A level table, for a 5-level model and a channel that depends on levels 2–4:
 
 ```
 &cov_cutoff_nml
-   vloc_types         = 'LAYER_TEMPERATURE_CH1',
-   vloc_nlev          = 5,
-   vloc_surface_level = 5,
+   vloc_types          = 'LAYER_TEMPERATURE_CH1',
+   vloc_nlev           = 5,
+   vloc_surface_level  = 5,
    vloc_factors(1:5,1) = 0.685, 1.0, 1.0, 1.0, 0.685,
+/
+```
+
+A pressure table, for a channel that depends on 850–300 hPa in a model that
+localizes in pressure. Rows run from the surface up; the factor is 1 across
+the support and tapers above and below it:
+
+```
+&cov_cutoff_nml
+   vloc_types          = 'SATELLITE_CHANNEL_7',
+   vloc_coord          = 'pressure',
+   vloc_nlev           = 6,
+   vloc_surface_level  = 1,
+   vloc_points(1:6,1)  = 100000.0, 85000.0, 60000.0, 30000.0, 20000.0, 10000.0,
+   vloc_factors(1:6,1) =      0.6,     1.0,     1.0,     1.0,     0.6,     0.1,
 /
 ```
