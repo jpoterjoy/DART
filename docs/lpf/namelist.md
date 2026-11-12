@@ -11,7 +11,7 @@ are those in `assim_tools_mod.pf.f90`.
 [`pf_kddm`](#pf_kddm) · [`bw_factor`](#bw_factor) · [`pf_merge`](#pf_merge) ·
 [`pf_nmoments`](#pf_nmoments) · [`pf_qm_moments`](#pf_qm_moments) ·
 [`pf_bin_rho`](#pf_bin_rho) · [`pf_cache_close`](#pf_cache_close) ·
-[`pf_seed`](#pf_seed) · [`pf_diag`](#pf_diag) ·
+[`pf_seed`](#pf_seed) · [`pf_resample_neff`](#pf_resample_neff) · [`pf_diag`](#pf_diag) ·
 [`pf_gather_mb`](#pf_gather_mb) · [`pf_profile`](#pf_profile) ·
 [`pf_enkf_hybrid`](#pf_enkf_hybrid) · [`min_residual`](#min_residual) ·
 [`pf_kf_rtps_coeff`](#pf_kf_rtps_coeff) · [`pf_alpha`](#pf_alpha)
@@ -133,6 +133,31 @@ adaptive localization or localization diagnostics.
 
 Offset for the resampling random seed. Different values give independent
 realizations of the same experiment.
+
+### `pf_resample_neff`
+**real, default `1.0`**
+
+An observation (or bin) is resampled, and its merges done, only when the
+effective ensemble size of its tempered weights is below
+`pf_resample_neff` × $N_e$.
+- `1.0`: always, unless the weights are exactly uniform.
+- `0.98`: the earlier rule, which skips resampling and merges when the weights
+  are nearly uniform; nearby variables then only accumulate the observation's
+  weights.
+
+Always merging was tested on bgrid with 3000 soundings (about 48,000 obs per
+6 h, tempered, bins 0.95, 40 days, seeds 1–3, prior RMSE on days 20–40):
+
+| Observation errors | `pf_resample_neff` | u | v | T | ps |
+|---|---|---|---|---|---|
+| As generated | 0.98 | 2.162 | 1.842 | 0.917 | 176 |
+| As generated | 1.0 | 2.162 | 1.839 | 0.915 | 175 |
+| Variances × 4 | 0.98 | 2.352 | 2.109 | 1.049 | 191 |
+| Variances × 4 | 1.0 | 2.346 | 2.107 | 1.048 | 192 |
+
+Always merging was not worse beyond seed noise in any variable, and with the
+broader likelihoods it lowered the u error in all three seeds. It took about
+7% longer to run.
 
 ### `pf_diag`
 **logical, default `.false.`**

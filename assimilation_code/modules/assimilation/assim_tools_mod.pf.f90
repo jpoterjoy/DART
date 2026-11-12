@@ -167,6 +167,11 @@ character(len=*), parameter :: source = 'assim_tools_mod.pf.f90'
 !                     3 (adds skewness), or 4 (adds kurtosis; matches lpf_update.m)
 !      pf_seed -> Offset for the random seed used in resampling (vary to get
 !                 independent runs of the same experiment)
+!      pf_resample_neff -> An ob (or bin) is resampled, and its merges done, only if the
+!                 effective ensemble size of its tempered weights is below
+!                 pf_resample_neff*Ne. Default 1.0: always, unless the weights are
+!                 exactly uniform; 0.98 restores the earlier rule (merges skipped
+!                 for nearly uniform weights)
 !      pf_cache_close -> Keep each ob's close-variable lists and localization factors
 !                 across tempering iterations, and its log-weight increments between
 !                 the regularization and update passes (faster; uses memory of about
@@ -217,6 +222,7 @@ integer  :: pf_maxiter                      = 1
 real(r8) :: pf_kf_rtps_coeff                = 0.0_r8
 integer  :: pf_nmoments                     = 4
 integer  :: pf_seed                         = 0
+real(r8) :: pf_resample_neff                = 1.0_r8    ! resample (and merge) an ob only if Neff < pf_resample_neff*Ne
 logical  :: pf_cache_close                  = .true.
 integer  :: pf_merge                        = 0
 integer  :: pf_qm_moments                   = 2
@@ -283,7 +289,7 @@ namelist / assim_tools_nml / filter_kind, cutoff, sort_obs_inc, &
    adaptive_localization_threshold, adaptive_cutoff_floor,                 &
    print_every_nth_obs, rectangular_quadrature, gaussian_likelihood_tails, &
    pf_kddm, frac_neff, pf_alpha, bw_factor, pf_enkf_hybrid,                &
-   min_residual, pf_maxiter, pf_kf_rtps_coeff, pf_nmoments, pf_seed,       &
+   min_residual, pf_maxiter, pf_kf_rtps_coeff, pf_nmoments, pf_seed, pf_resample_neff,       &
    pf_cache_close, pf_merge, pf_qm_moments, pf_bin_rho,                    &
    pf_diag, pf_profile, pf_gather_mb,                                      &
    output_localization_diagnostics, localization_diagnostics_file,         &
@@ -1361,7 +1367,7 @@ ITERATIONS: do iter = 1,maxiter
               d = d - minval(d)
               pf_sw = exp( -d )
               pf_sw = pf_sw / sum(pf_sw)
-              if (1.0_r8 < ens_size * 0.98_r8 * sum(pf_sw*pf_sw) ) then
+              if (1.0_r8 < ens_size * pf_resample_neff * sum(pf_sw*pf_sw) ) then
                  call pf_sample(pf_sw, ens_size, indx)
               else
                  indx = 0
@@ -1402,7 +1408,7 @@ ITERATIONS: do iter = 1,maxiter
                        d = d - minval(d)
                        pf_sw = exp( -d )
                        pf_sw = pf_sw / sum(pf_sw)
-                       if (1.0_r8 < ens_size * 0.98_r8 * sum(pf_sw*pf_sw) ) then
+                       if (1.0_r8 < ens_size * pf_resample_neff * sum(pf_sw*pf_sw) ) then
                           call pf_sample(pf_sw, ens_size, indx)
                        else
                           indx = 0
@@ -1544,7 +1550,7 @@ ITERATIONS: do iter = 1,maxiter
           pf_sw = pf_sw / sum(pf_sw)
 
           ! Skip re-sampling when the weights are nearly uniform
-          if (1.0_r8 < ens_size * 0.98_r8 * sum(pf_sw*pf_sw) ) then
+          if (1.0_r8 < ens_size * pf_resample_neff * sum(pf_sw*pf_sw) ) then
             call pf_sample(pf_sw, ens_size, indx)
           else
             indx = 0
@@ -2324,7 +2330,7 @@ ITERATIONS: do iter = 1,maxiter
             d = d - minval(d)
             pf_sw = exp( -d )
             pf_sw = pf_sw / sum(pf_sw)
-            if (1.0_r8 < ens_size * 0.98_r8 * sum(pf_sw*pf_sw) ) then
+            if (1.0_r8 < ens_size * pf_resample_neff * sum(pf_sw*pf_sw) ) then
                call pf_sample(pf_sw, ens_size, indx)
             else
                indx = 0

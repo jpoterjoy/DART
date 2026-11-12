@@ -108,10 +108,12 @@ For each observation, in sequence order:
 1. **Resample at the observation.** The task that owns the observation draws
    $N_e$ indices by systematic resampling (`pf_sample`) from the
    observation's own tempered, localized weights. Particles that survive keep
-   their index, and the duplicates fill the vacated slots in random order. If
-   the weights are nearly uniform ($N_\text{eff} \gt  0.98~N_e$), resampling is
-   skipped. Nearby variables then only accumulate this observation's weights
-   (step 2), with no merge.
+   their index, and the duplicates fill the vacated slots in random order.
+   Resampling, and the merges that follow it, are skipped only when the
+   weights are exactly uniform. An earlier rule also skipped them when the
+   weights were nearly uniform ($N_\text{eff} \gt  0.98~N_e$), so that nearby
+   variables only accumulated the observation's weights, with no merge; set
+   [`pf_resample_neff`](namelist.md#pf_resample_neff) to 0.98 to restore it.
 2. **Weight each nearby variable.** Every state variable and observation prior
    within the localization radius adds this observation's $-\log\omega_i$ to
    its running sum. It forms its posterior weights $\exp(-\beta \ell_i)$ and
