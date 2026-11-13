@@ -10,6 +10,7 @@ are those in `assim_tools_mod.pf.f90`.
 [`cutoff`](#cutoff) · [`frac_neff`](#frac_neff) · [`pf_maxiter`](#pf_maxiter) ·
 [`pf_kddm`](#pf_kddm) · [`bw_factor`](#bw_factor) · [`pf_merge`](#pf_merge) ·
 [`pf_nmoments`](#pf_nmoments) · [`pf_qm_moments`](#pf_qm_moments) ·
+[`pf_abs_floors`](#pf_abs_floors) ·
 [`pf_bin_rho`](#pf_bin_rho) · [`pf_cache_close`](#pf_cache_close) ·
 [`pf_seed`](#pf_seed) · [`pf_resample_neff`](#pf_resample_neff) · [`pf_diag`](#pf_diag) ·
 [`pf_gather_mb`](#pf_gather_mb) · [`pf_profile`](#pf_profile) ·
@@ -106,6 +107,19 @@ With `pf_merge = 1`, the adjustment after quantile mapping:
 - `2`: shift and scale to the exact posterior mean and variance.
 - `1`: shift to the mean only.
 - `0`: none.
+
+### `pf_abs_floors`
+**logical, default `.false.`**
+
+Scale of the merges' numerical safeguards (zero-spread tests, target variance
+floor, skewness/kurtosis gates):
+- `.false.`: relative to each variable's mean and spread.
+- `.true.`: the absolute values used before November 2026 (variance floor
+  `1e-12`, i.e. a target standard deviation of at least `1e-6`; gates `1e-5`).
+  These assume O(1) variables. Variables in small units (ozone, cloud or
+  stratospheric moisture mixing ratios in kg/kg) get their spread inflated
+  toward `1e-6` at every merge, which compounds over cycles. Found in the GSI
+  port, where tropospheric ozone grew tenfold within a few hourly cycles.
 
 ### `pf_bin_rho`
 **real, default `0.0` (off)**

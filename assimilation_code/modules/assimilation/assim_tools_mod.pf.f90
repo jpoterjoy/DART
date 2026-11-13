@@ -186,6 +186,12 @@ character(len=*), parameter :: source = 'assim_tools_mod.pf.f90'
 !                 2 shifts and scales them to the posterior mean and variance
 !                 (default), 1 shifts them to the posterior mean only, 0 leaves
 !                 them as mapped.
+!      pf_abs_floors -> .false. (default): the merges' zero-spread tests, target
+!                 variance floor and skewness/kurtosis gates are relative to each
+!                 variable's mean/spread. .true.: the absolute values 1e-12 (variance
+!                 floor, i.e. a target std of at least 1e-6) and 1e-5 (gates), meant
+!                 for O(1) variables; they inflate small-unit variables (e.g. ozone
+!                 or cloud mixing ratios) toward std 1e-6 at every merge.
 !      pf_bin_rho -> Bin nearby obs for the PF merge: obs whose localization
 !                 coefficient with a bin's centroid is at least pf_bin_rho
 !                 are merged together, once, after the bin's last ob (weights
@@ -226,6 +232,7 @@ real(r8) :: pf_resample_neff                = 1.0_r8    ! resample (and merge) a
 logical  :: pf_cache_close                  = .true.
 integer  :: pf_merge                        = 0
 integer  :: pf_qm_moments                   = 2
+logical  :: pf_abs_floors                   = .false.
 real(r8) :: pf_bin_rho                      = 0.0_r8
 logical  :: pf_diag                         = .false.
 logical  :: pf_profile                      = .false.
@@ -290,7 +297,7 @@ namelist / assim_tools_nml / filter_kind, cutoff, sort_obs_inc, &
    print_every_nth_obs, rectangular_quadrature, gaussian_likelihood_tails, &
    pf_kddm, frac_neff, pf_alpha, bw_factor, pf_enkf_hybrid,                &
    min_residual, pf_maxiter, pf_kf_rtps_coeff, pf_nmoments, pf_seed, pf_resample_neff,       &
-   pf_cache_close, pf_merge, pf_qm_moments, pf_bin_rho,                    &
+   pf_cache_close, pf_merge, pf_qm_moments, pf_abs_floors, pf_bin_rho,     &
    pf_diag, pf_profile, pf_gather_mb,                                      &
    output_localization_diagnostics, localization_diagnostics_file,         &
    special_localization_obs_types, special_localization_cutoffs,           &
@@ -3599,7 +3606,7 @@ real(r8), intent(in)  :: xo(ens_size)      ! Particles the weights refer to
 real(r8), intent(in)  :: w(ens_size)       ! Normalized posterior weights of xo
 integer,  intent(in)  :: n_moments         ! Moments to fit (2, 3, or 4)
 
-real(r8) :: Ne_r8, sig_p, sig_t, max_z, s2, s3, s4, denom_3, neff, lim, sz, mz
+real(r8) :: Ne_r8, sig_p, sig_t, max_z, s2, s3, s4, denom_3, neff, lim, sz, mz, tol_p, gate
 real(r8) :: skew_t, skew_p, delta_S, kurt_t, kurt_p, delta_K, ew
 real(r8) :: xa(ens_size), dx_p(ens_size), dx_t(ens_size), z(ens_size), z_new(ens_size)
 real(r8) :: z2(ens_size), dt2(ens_size), wd2(ens_size)
@@ -3614,14 +3621,27 @@ xa = loc*(ens_s - ens_mean) + (1.0_r8 - loc)*(ens - ens_mean)
 dx_p  = xa - sum(xa)/Ne_r8
 sig_p = sqrt(sum(dx_p*dx_p)/(Ne_r8 - 1.0_r8))
 
-! Where the spread is zero, use the resampled particles
-if (sig_p <= 1.0e-12_r8) then
+! Where the spread is zero, use the resampled particles. The floor and gates
+! are relative to the variable's scale unless pf_abs_floors (absolute values
+! assume O(1) variables and inflate e.g. ozone, std ~1e-8, to std 1e-6).
+if (pf_abs_floors) then
+   tol_p = 1.0e-12_r8
+else
+   tol_p = 1.0e-12_r8*max(abs(ens_mean), sqrt(max(ens_var, 0.0_r8)), tiny(1.0_r8))
+end if
+if (sig_p <= tol_p) then
    incr = ens_s - ens
    return
 end if
 
 z     = dx_p/sig_p
-sig_t = sqrt(max(ens_var, 1.0e-12_r8))
+if (pf_abs_floors) then
+   sig_t = sqrt(max(ens_var, 1.0e-12_r8))
+   gate  = 1.0e-5_r8
+else
+   sig_t = sqrt(max(ens_var, 0.0_r8))
+   gate  = 1.0e-5_r8*sig_p
+end if
 
 if (n_moments >= 3) then
 
@@ -3639,7 +3659,7 @@ if (n_moments >= 3) then
 
    ! Skewness: target (weighted, bias-corrected) minus particles (G1)
    denom_3 = 1.0_r8 - 3.0_r8*s2 + 2.0_r8*s3
-   if (sig_t > 1.0e-5_r8 .and. denom_3 > 1.0e-4_r8) then
+   if (sig_t > gate .and. denom_3 > 1.0e-4_r8) then
       skew_t = (sum(wd2*dx_t)/denom_3)/(sig_t*sig_t*sig_t)
    else
       skew_t = 0.0_r8
@@ -3663,7 +3683,7 @@ if (n_moments >= 3) then
       call pf_kurt(ew, ew*ew, ew*ew*ew, mz, sum(z2*z2)*ew, kurt_p, ok_p)
       s4 = sum((w*w)*(w*w))
       call pf_kurt(s2, s3, s4, sum(wd2), sum(wd2*dt2), kurt_t, ok_t)
-      if (ok_p .and. ok_t .and. sig_t > 1.0e-5_r8) then
+      if (ok_p .and. ok_t .and. sig_t > gate) then
          delta_K = kurt_t - kurt_p
          delta_K = delta_K**3/(delta_K**2 + 24.0_r8/neff + 24.0_r8/Ne_r8)  ! reliability shrinkage
          lim     = 4.0_r8/(max_z*max_z)
@@ -3771,7 +3791,7 @@ integer,  intent(in)  :: io(ens_size)      ! Sort order of xo (ascending)
 
 real(r8) :: b(ens_size), y(ens_size), xa(ens_size)
 real(r8) :: xk(0:ens_size+1), pk(0:ens_size+1)
-real(r8) :: Ne_r8, sig_t, neff, r, cw, q, dp, f, mu, sd
+real(r8) :: Ne_r8, sig_t, neff, r, cw, q, dp, f, mu, sd, tol_p
 integer  :: ib(ens_size), j, k
 
 Ne_r8 = real(ens_size, r8)
@@ -3781,7 +3801,12 @@ b = loc*(ens_s - ens_mean) + (1.0_r8 - loc)*(ens - ens_mean)
 call index_sort(b, ib, ens_size)
 
 ! Target CDF knots: sorted xo at mid-point cumulative weights, plus tails
-sig_t = sqrt(max(ens_var, 1.0e-12_r8))
+! (variance floor absolute only with pf_abs_floors, see pf_update)
+if (pf_abs_floors) then
+   sig_t = sqrt(max(ens_var, 1.0e-12_r8))
+else
+   sig_t = sqrt(max(ens_var, 0.0_r8))
+end if
 neff  = 1.0_r8 / sum(w*w)
 r     = sqrt(5.0_r8) * sqrt(2.0_r8) * neff**(-0.2_r8) * sig_t
 cw = 0.0_r8
@@ -3812,7 +3837,12 @@ do k = 1, ens_size
 end do
 mu = sum(xa)/Ne_r8
 sd = sqrt(sum((xa - mu)**2)/(Ne_r8 - 1.0_r8))
-if (sd <= 1.0e-12_r8) then
+if (pf_abs_floors) then
+   tol_p = 1.0e-12_r8
+else
+   tol_p = 1.0e-12_r8*max(abs(mu), tiny(1.0_r8))
+end if
+if (sd <= tol_p) then
    xa = ens_s
 else if (pf_qm_moments == 2) then
    xa = ens_mean + (xa - mu)*(sig_t/sd)
